@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { MonitorUp, PauseCircle, PictureInPicture2, Play, RotateCcw, Send, Upload } from "lucide-react";
+import { Brain, MonitorUp, PauseCircle, PictureInPicture2, Play, RotateCcw, Send, Upload } from "lucide-react";
 import "./styles.css";
 
 type Category = "EXPLICIT_CUE" | "IMPLICIT_CUE" | "CHIME_IN" | "KEEP_SILENCE";
@@ -69,6 +69,49 @@ const defaultDelegate: Delegate = {
   ],
 };
 
+const advisorDelegate: Delegate = {
+  name: "Advisor",
+  role: "Senior product and engineering advisor for the AI Call Advisor project",
+  meeting_intents: [
+    "Help evaluate whether the product should prioritize floating widget, browser extension, or web dashboard workflows",
+    "Identify product risks around privacy, meeting consent, latency, transcription errors, and user trust",
+    "Suggest pragmatic next implementation steps for a meeting delegate MVP",
+    "Challenge decisions that make the assistant too autonomous before user approval and auditability exist",
+  ],
+  shareable_information: [
+    {
+      context: "When the team discusses the frontend, floating widget, browser extension, or meeting UI",
+      information:
+        "The current product has a web dashboard and a Document Picture-in-Picture floating widget. The widget is a good MVP for always-on-top assistance, while a browser extension is likely better later for lower-friction capture inside Meet or Teams.",
+    },
+    {
+      context: "When the team discusses live meetings, Teams, Google Meet, audio capture, or transcription",
+      information:
+        "The current implementation captures the meeting tab audio and local microphone, sends audio chunks to the backend, transcribes with faster-whisper, and processes utterance.final events through MeetingEngine.",
+    },
+    {
+      context: "When the team discusses LLM integration or local models",
+      information:
+        "The backend talks to LM Studio through OpenAI-compatible endpoints. The important endpoints are GET /v1/models and POST /v1/chat/completions.",
+    },
+    {
+      context: "When the team discusses what the assistant should say during meetings",
+      information:
+        "The assistant should be cautious. It should respond when explicitly cued, when the delegate role is clearly relevant, or when a short contribution materially advances the meeting. Otherwise it should keep silence.",
+    },
+    {
+      context: "When privacy, compliance, or real-world deployment is discussed",
+      information:
+        "The safest product phase is Assist, not full Delegate. The assistant should suggest responses, keep an audit trail, and require user approval before speaking on behalf of the user.",
+    },
+    {
+      context: "When the team discusses next steps",
+      information:
+        "The next high-leverage steps are: add attendees to the meeting profile, improve noisy-name cue detection, add approval actions to the widget, and build a simple manual test script for repeated product demos.",
+    },
+  ],
+};
+
 const defaultReplay = JSON.stringify(
   {
     delegate: defaultDelegate,
@@ -76,6 +119,31 @@ const defaultReplay = JSON.stringify(
       { id: 1, speaker: "Alice", text: "The voice UI is ready for integration testing." },
       { id: 2, speaker: "Carol", text: "There are still latency spikes when people talk over each other." },
       { id: 3, speaker: "Alice", text: "Bob, what does backend think about this?" },
+    ],
+  },
+  null,
+  2,
+);
+
+const advisorReplay = JSON.stringify(
+  {
+    delegate: advisorDelegate,
+    utterances: [
+      {
+        id: 1,
+        speaker: "Vini",
+        text: "Estamos decidindo se o assistente deve ser só dashboard, floating widget ou extensão do Chrome.",
+      },
+      {
+        id: 2,
+        speaker: "Carol",
+        text: "Minha preocupação é que extensão parece mais produto real, mas talvez aumente muito a complexidade agora.",
+      },
+      {
+        id: 3,
+        speaker: "Vini",
+        text: "Advisor, o que você acha que deveríamos priorizar para o MVP?",
+      },
     ],
   },
   null,
@@ -144,6 +212,25 @@ function App() {
         id: crypto.randomUUID(),
         role: "assistant",
         text: "Contexto limpo. Abra uma reunião live ou rode um replay para começar de novo.",
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+  }
+
+  function loadAdvisorProfile() {
+    stopLive();
+    setDelegate(advisorDelegate);
+    setReplayJson(advisorReplay);
+    setMeetingId("");
+    setUtterances([]);
+    setDecisions([]);
+    setMode("REPLAY");
+    setDebug({});
+    setChatMessages([
+      {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        text: "Perfil Advisor carregado. Use o replay ou uma chamada live e chame 'Advisor' quando quiser uma opinião.",
         timestamp: new Date().toISOString(),
       },
     ]);
@@ -518,6 +605,9 @@ function App() {
         </label>
 
         <div className="actions">
+          <button onClick={loadAdvisorProfile}>
+            <Brain size={16} /> Load advisor profile
+          </button>
           <button onClick={startReplay}>
             <Play size={16} /> Start replay
           </button>

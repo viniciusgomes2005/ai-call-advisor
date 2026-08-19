@@ -153,6 +153,57 @@ O backend nunca envia falas futuras ao prompt; há teste automatizado para isso.
 3. Clique no botão de envio.
 4. A decisão aparece no painel direito e é persistida em `data/sessions/{meeting_id}`.
 
+## Treinar por Contexto para uma Chamada Manual
+
+Para testar se a IA consegue opinar em uma chamada real, use o perfil pronto `Advisor`. Ele não é fine-tuning; é um contexto carregado antes da reunião com papel, objetivos e informações que a IA pode usar.
+
+No frontend:
+
+1. Clique `Load advisor profile`.
+2. Confirme que o nome do delegate virou `Advisor`.
+3. Abra o `Floating widget`, se quiser acompanhar em modo compacto.
+4. Inicie `Start live meeting` ou use `Start replay`.
+
+Perfil salvo em:
+
+```text
+backend/profiles/ai_call_advisor_design_review.json
+```
+
+Esse perfil dá contexto sobre:
+
+- dashboard web versus floating widget versus extensão Chrome
+- captura de áudio em Meet/Teams
+- integração com LM Studio
+- cautela para não interromper a reunião
+- riscos de privacidade, consentimento, latência e confiança
+- próximos passos técnicos do produto
+
+Roteiro simples para testar em uma chamada:
+
+```text
+Vini: Estamos decidindo se o assistente deve ser só dashboard, floating widget ou extensão do Chrome.
+Carol: Minha preocupação é que extensão parece mais produto real, mas talvez aumente muito a complexidade agora.
+Vini: Advisor, o que você acha que deveríamos priorizar para o MVP?
+```
+
+Resposta esperada: a IA deve reconhecer uma `EXPLICIT_CUE` e sugerir priorizar o floating widget como MVP, deixando extensão para uma fase seguinte.
+
+Outro roteiro para testar opinião espontânea:
+
+```text
+Vini: O widget flutuante já funciona, mas ainda não tem aprovação antes de falar por mim.
+Carol: Também falta uma forma clara de auditar o que a IA sugeriu durante a reunião.
+```
+
+Resposta esperada: a IA pode classificar como `CHIME_IN` e sugerir que o produto fique na fase Assist, com sugestões aprovadas pelo usuário e audit trail, antes de qualquer fala autônoma.
+
+Se quiser perguntar pelo chat do floating widget:
+
+```text
+Qual seria o próximo passo mais importante para deixar esse MVP confiável?
+```
+
 ## Testar Upload de Áudio
 
 1. Clique `Upload WAV/MP3/M4A`.
@@ -160,6 +211,38 @@ O backend nunca envia falas futuras ao prompt; há teste automatizado para isso.
 3. O backend usa `faster-whisper` local e envia cada segmento ao mesmo MeetingEngine.
 
 `ffmpeg` precisa estar disponível no sistema para formatos comprimidos.
+
+## Smoke Test da IA
+
+Use este teste quando quiser validar rapidamente a comunicação backend -> LM Studio -> LLM sem rodar o benchmark completo.
+
+Pré-condições:
+
+- backend rodando em `http://localhost:8000`
+- LM Studio com servidor OpenAI-compatible ligado
+- um modelo carregado no LM Studio
+
+```bash
+npm run smoke:ai
+```
+
+O teste faz três coisas:
+
+- chama `/health` e confirma `lm_studio: ok`
+- roda um replay curto com uma pergunta explícita para o delegate
+- faz uma pergunta ao endpoint `/meetings/{meeting_id}/questions`
+
+Se o backend estiver em outra URL:
+
+```bash
+API_URL=http://localhost:8010 npm run smoke:ai
+```
+
+Se quiser forçar um modelo específico:
+
+```bash
+MODEL=nome-do-modelo npm run smoke:ai
+```
 
 ## Benchmark
 
