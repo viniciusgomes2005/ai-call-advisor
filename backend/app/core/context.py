@@ -65,7 +65,33 @@ class ContextManager:
             latest_text=latest_utterance.text,
         )
 
+    def build_question_prompt(self, state: MeetingState, question: str) -> str:
+        self.update_recent_context(state)
+        transcript = self._format_transcript(state.recent_context)
+        if len(transcript) > self.max_chars:
+            transcript = transcript[-self.max_chars :]
+        shareable = "\n".join(
+            f"- Context: {item.context}\n  Information: {item.information}"
+            for item in state.delegate.shareable_information
+        ) or "None"
+        intents = "\n".join(f"- {intent}" for intent in state.delegate.meeting_intents) or "None"
+        previous = "\n".join(
+            f"- after utterance {item.utterance_id}: {item.category} - {item.response}"
+            for item in state.previous_interventions[-10:]
+        ) or "None"
+        return (
+            f"Delegate: {state.delegate.name}\n"
+            f"Role: {state.delegate.role}\n\n"
+            f"Meeting intents:\n{intents}\n\n"
+            f"Shareable information:\n{shareable}\n\n"
+            f"Previous assistant interventions:\n{previous}\n\n"
+            f"Earlier summary:\n{state.summary or 'None'}\n\n"
+            f"Recent transcript:\n{transcript or 'None'}\n\n"
+            f"Question: {question}\n\n"
+            "Answer in the same language as the question. Be brief and practical. "
+            "Do not invent facts outside the transcript or shareable information."
+        )
+
     @staticmethod
     def _format_transcript(utterances: list[Utterance]) -> str:
         return "\n".join(f"[{u.id}] {u.speaker}: {u.text}" for u in utterances)
-

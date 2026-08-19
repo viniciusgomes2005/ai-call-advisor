@@ -60,6 +60,14 @@ class LiveMeetingSession:
                 )
             decision = await self.engine.ingest_utterance(utterance)
             if self.on_event:
+                for insight in self.engine.insights_for_utterance(utterance.id):
+                    await self.on_event(
+                        MeetingEvent(
+                            type="meeting.insight.detected",
+                            meeting_id=self.engine.state.meeting_id,
+                            payload=insight.model_dump(mode="json"),
+                        )
+                    )
                 await self.on_event(
                     MeetingEvent(
                         type="intervention.decided",
@@ -73,4 +81,3 @@ class LiveMeetingSession:
     async def drain(self) -> None:
         if self._tasks:
             await asyncio.gather(*self._tasks)
-

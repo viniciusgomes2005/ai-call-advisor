@@ -93,13 +93,40 @@ async def test_replay_never_leaks_future_utterances(tmp_path, delegate, prompt_p
     assert "future secret utterance" in llm.prompts[1]
 
 
+async def test_answer_question_uses_meeting_context(tmp_path, delegate, prompt_path):
+    llm = StaticLLMProvider()
+    engine = make_test_engine(tmp_path, delegate, llm, prompt_path)
+    await engine.ingest_utterance(Utterance(id=1, speaker="Alice", text="The voice feature is blocked by latency."))
+
+    answer = await engine.answer_question("What is blocking the voice feature?")
+
+    assert answer.answer == "Static answer from meeting context."
+    assert "The voice feature is blocked by latency." in llm.prompts[-1]
+    assert "Question: What is blocking the voice feature?" in llm.prompts[-1]
+
+
+async def test_meeting_insights_are_detected(tmp_path, delegate, prompt_path):
+    llm = StaticLLMProvider()
+    engine = make_test_engine(tmp_path, delegate, llm, prompt_path)
+
+    await engine.ingest_utterance(
+        Utterance(id=1, speaker="Alice", text="Fechado, vamos seguir com o plano e eu vou validar a latência.")
+    )
+    await engine.ingest_utterance(Utterance(id=2, speaker="Carol", text="Quem vai apresentar os resultados?"))
+
+    insight_types = {insight.type for insight in engine.state.insights}
+    assert "DECISION" in insight_types
+    assert "ACTION_ITEM" in insight_types
+    assert "OPEN_QUESTION" in insight_types
+
+
 async def test_session_persistence(tmp_path, delegate, prompt_path):
     llm = StaticLLMProvider()
     engine = make_test_engine(tmp_path, delegate, llm, prompt_path)
-    await engine.ingest_utterance(Utterance(id=1, speaker="Alice", text="hello"))
+    await engine.ingest_utterance(Utterance(id=1, speaker="Alice", text="Quem vai validar a latência?"))
     session_dir = tmp_path / "sessions" / engine.state.meeting_id
     assert (session_dir / "meeting.json").exists()
     assert (session_dir / "utterances.jsonl").exists()
     assert (session_dir / "decisions.jsonl").exists()
+    assert (session_dir / "insights.jsonl").exists()
     assert (session_dir / "metrics.json").exists()
-

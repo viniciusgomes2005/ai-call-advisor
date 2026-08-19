@@ -6,7 +6,7 @@ import pytest
 
 from app.core.context import ContextManager
 from app.core.dedup import Deduplicator
-from app.llm.provider import LLMProvider, LLMResult, fallback_silence
+from app.llm.provider import LLMProvider, LLMResult, LLMTextResult, fallback_silence
 from app.meeting import MeetingEngine
 from app.schemas import DelegateProfile, InterventionCategory, LLMDecision, ModelInfo
 from app.services.logger import EventLogger
@@ -23,6 +23,10 @@ class StaticLLMProvider(LLMProvider):
     async def decide_intervention(self, prompt: str, model: str | None = None) -> LLMResult:
         self.prompts.append(prompt)
         return LLMResult(self.decision, model or "test-model", 10, 20, 3, self.decision.model_dump_json())
+
+    async def answer_question(self, prompt: str, model: str | None = None) -> LLMTextResult:
+        self.prompts.append(prompt)
+        return LLMTextResult("Static answer from meeting context.", model or "test-model", 10, 20, 3)
 
 
 class HeuristicLLMProvider(StaticLLMProvider):
@@ -94,4 +98,3 @@ def make_test_engine(
         event_logger=EventLogger(tmp_path / "sessions"),
         deduplicator=Deduplicator(cooldown_seconds, filter_enabled),
     )
-

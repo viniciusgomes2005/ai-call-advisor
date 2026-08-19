@@ -7,10 +7,13 @@ from pathlib import Path
 
 from app.core.context import PROMPT_VERSION, ContextManager
 from app.core.dedup import Deduplicator
+from app.core.insights import detect_meeting_insights
 from app.llm import LLMProvider
 from app.schemas import (
     DelegateProfile,
     InterventionDecision,
+    MeetingInsight,
+    MeetingQuestionResponse,
     MeetingState,
     PreviousIntervention,
     Utterance,
@@ -40,14 +43,33 @@ class MeetingEngine:
         self._lock = asyncio.Lock()
         self.event_logger.start_session(self.state)
 
+    async def answer_question(self, question: str) -> MeetingQuestionResponse:
+        async with self._lock:
+            prompt = self.context_manager.build_question_prompt(self.state, question)
+
+        result = await self.llm_provider.answer_question(prompt, self.model)
+        return MeetingQuestionResponse(
+            meeting_id=self.state.meeting_id,
+            question=question,
+            answer=result.text,
+            model=result.model,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            llm_latency_ms=result.latency_ms,
+        )
+
     async def ingest_utterance(self, utterance: Utterance) -> InterventionDecision:
         pipeline_start = time.perf_counter()
         async with self._lock:
             if any(existing.id == utterance.id for existing in self.state.utterances):
                 utterance.id = max((u.id for u in self.state.utterances), default=0) + 1
             self.state.utterances.append(utterance)
+            insights = detect_meeting_insights(utterance)
+            self.state.insights.extend(insights)
             self.context_manager.update_recent_context(self.state)
             self.event_logger.log_utterance(self.state.meeting_id, utterance)
+            for insight in insights:
+                self.event_logger.log_insight(self.state.meeting_id, insight)
             prompt = self.context_manager.build_prompt(self.state, utterance)
 
         result = await self.llm_provider.decide_intervention(prompt, self.model)
@@ -83,6 +105,9 @@ class MeetingEngine:
             self.event_logger.save_state(self.state)
         return decision
 
+    def insights_for_utterance(self, utterance_id: int) -> list[MeetingInsight]:
+        return [insight for insight in self.state.insights if insight.utterance_id == utterance_id]
+
     @classmethod
     def from_paths(
         cls,
@@ -108,4 +133,3 @@ class MeetingEngine:
             model=model,
             max_suggestion_age_seconds=max_suggestion_age_seconds,
         )
-

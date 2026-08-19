@@ -19,6 +19,12 @@ class InterventionCategory(StrEnum):
     KEEP_SILENCE = "KEEP_SILENCE"
 
 
+class MeetingInsightType(StrEnum):
+    OPEN_QUESTION = "OPEN_QUESTION"
+    ACTION_ITEM = "ACTION_ITEM"
+    DECISION = "DECISION"
+
+
 class ShareableInformation(BaseModel):
     context: str
     information: str
@@ -89,6 +95,17 @@ class PreviousIntervention(BaseModel):
     response: str
 
 
+class MeetingInsight(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    type: MeetingInsightType
+    utterance_id: int
+    speaker: str
+    text: str
+    reason: str
+    confidence: float = Field(ge=0, le=1)
+    timestamp: datetime = Field(default_factory=utc_now)
+
+
 class MeetingState(BaseModel):
     meeting_id: str = Field(default_factory=lambda: str(uuid4()))
     delegate: DelegateProfile
@@ -96,6 +113,7 @@ class MeetingState(BaseModel):
     recent_context: list[Utterance] = Field(default_factory=list)
     summary: str = ""
     previous_interventions: list[PreviousIntervention] = Field(default_factory=list)
+    insights: list[MeetingInsight] = Field(default_factory=list)
 
 
 class ReplayRequest(BaseModel):
@@ -109,6 +127,28 @@ class ManualUtteranceRequest(BaseModel):
     speaker: str = "UNKNOWN"
     text: str
     source: Literal["MANUAL", "REMOTE_AUDIO", "LOCAL_MIC_AUDIO", "FILE_AUDIO", "UNKNOWN"] = "MANUAL"
+
+
+class MeetingQuestionRequest(BaseModel):
+    question: str
+
+    @field_validator("question")
+    @classmethod
+    def non_empty_question(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("question cannot be empty")
+        return value
+
+
+class MeetingQuestionResponse(BaseModel):
+    meeting_id: str
+    question: str
+    answer: str
+    model: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    llm_latency_ms: int | None = None
 
 
 class CreateMeetingRequest(BaseModel):
@@ -152,4 +192,3 @@ class BenchmarkCase(BaseModel):
     utterances: list[Utterance]
     evaluation_at_utterance: int
     expected: BenchmarkExpected
-

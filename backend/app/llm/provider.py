@@ -23,6 +23,15 @@ class LLMResult:
     raw_response: str
 
 
+@dataclass(slots=True)
+class LLMTextResult:
+    text: str
+    model: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    latency_ms: int
+
+
 class LLMProvider(abc.ABC):
     @abc.abstractmethod
     async def list_models(self) -> list[ModelInfo]:
@@ -30,6 +39,10 @@ class LLMProvider(abc.ABC):
 
     @abc.abstractmethod
     async def decide_intervention(self, prompt: str, model: str | None = None) -> LLMResult:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def answer_question(self, prompt: str, model: str | None = None) -> LLMTextResult:
         raise NotImplementedError
 
 
@@ -154,3 +167,44 @@ class LMStudioProvider(LLMProvider):
             raw_response=raw_response,
         )
 
+    async def answer_question(self, prompt: str, model: str | None = None) -> LLMTextResult:
+        selected_model = model or self.default_model
+        if not selected_model:
+            models = await self.list_models()
+            selected_model = models[0].id if models else ""
+        if not selected_model:
+            return LLMTextResult("No LM Studio model is loaded.", None, None, None, 0)
+
+        start = time.perf_counter()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json={
+                    "model": selected_model,
+                    "temperature": 0.2,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Answer concisely using only the meeting context provided. "
+                                "If the answer is not in the context, say that it is not available yet."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+
+        usage = payload.get("usage") or {}
+        text = payload["choices"][0]["message"]["content"].strip()
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        return LLMTextResult(
+            text=text,
+            model=selected_model,
+            input_tokens=usage.get("prompt_tokens"),
+            output_tokens=usage.get("completion_tokens"),
+            latency_ms=latency_ms,
+        )

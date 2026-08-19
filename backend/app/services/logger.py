@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from app.schemas import InterventionDecision, MeetingState, Utterance
+from app.schemas import InterventionDecision, MeetingInsight, MeetingState, Utterance
 
 
 class EventLogger:
@@ -17,7 +17,7 @@ class EventLogger:
         session_dir = self.base_dir / state.meeting_id
         session_dir.mkdir(parents=True, exist_ok=True)
         self._write_json(session_dir / "meeting.json", state)
-        metrics = {"utterance_count": 0, "decision_count": 0, "intervention_count": 0}
+        metrics = {"utterance_count": 0, "decision_count": 0, "intervention_count": 0, "insight_count": 0}
         self._write_json(session_dir / "metrics.json", metrics)
         return session_dir
 
@@ -31,6 +31,17 @@ class EventLogger:
         session_dir.mkdir(parents=True, exist_ok=True)
         self._append_jsonl(session_dir / "decisions.jsonl", decision)
         self._update_metrics(session_dir, decision)
+
+    def log_insight(self, meeting_id: str, insight: MeetingInsight) -> None:
+        session_dir = self.base_dir / meeting_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        self._append_jsonl(session_dir / "insights.jsonl", insight)
+        path = session_dir / "metrics.json"
+        metrics: dict[str, Any] = {}
+        if path.exists():
+            metrics = json.loads(path.read_text(encoding="utf-8"))
+        metrics["insight_count"] = int(metrics.get("insight_count", 0)) + 1
+        self._write_json(path, metrics)
 
     def save_state(self, state: MeetingState) -> None:
         self._write_json(self.base_dir / state.meeting_id / "meeting.json", state)
@@ -63,4 +74,3 @@ class EventLogger:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(value.model_dump(mode="json"), ensure_ascii=False) + "\n")
-

@@ -16,6 +16,7 @@ from app.schemas import (
     DelegateProfile,
     HealthResponse,
     ManualUtteranceRequest,
+    MeetingQuestionRequest,
     MeetingEvent,
     MeetingResponse,
     ReplayRequest,
@@ -69,7 +70,20 @@ async def manual_utterance(meeting_id: str, request: ManualUtteranceRequest):
         source=request.source,
     )
     decision = await engine.ingest_utterance(utterance)
-    return {"utterance": utterance.model_dump(mode="json"), "decision": decision.model_dump(mode="json")}
+    return {
+        "utterance": utterance.model_dump(mode="json"),
+        "decision": decision.model_dump(mode="json"),
+        "insights": [insight.model_dump(mode="json") for insight in engine.insights_for_utterance(utterance.id)],
+    }
+
+
+@router.post("/meetings/{meeting_id}/questions")
+async def ask_question(meeting_id: str, request: MeetingQuestionRequest):
+    engine = ENGINES.get(meeting_id)
+    if not engine:
+        raise HTTPException(status_code=404, detail="meeting not found")
+    answer = await engine.answer_question(request.question)
+    return answer.model_dump(mode="json")
 
 
 @router.post("/replay")
@@ -80,6 +94,7 @@ async def replay(request: ReplayRequest, model: str | None = None):
     return {
         "meeting_id": engine.state.meeting_id,
         "decisions": [decision.model_dump(mode="json") for decision in decisions],
+        "insights": [insight.model_dump(mode="json") for insight in engine.state.insights],
     }
 
 
@@ -106,7 +121,13 @@ async def upload_audio(meeting_id: str, file: Annotated[UploadFile, File()], spe
             source="FILE_AUDIO",
         )
         decision = await engine.ingest_utterance(utterance)
-        outputs.append({"utterance": utterance.model_dump(mode="json"), "decision": decision.model_dump(mode="json")})
+        outputs.append(
+            {
+                "utterance": utterance.model_dump(mode="json"),
+                "decision": decision.model_dump(mode="json"),
+                "insights": [insight.model_dump(mode="json") for insight in engine.insights_for_utterance(utterance.id)],
+            }
+        )
     return {"segments": outputs}
 
 
