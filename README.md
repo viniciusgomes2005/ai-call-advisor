@@ -8,49 +8,132 @@ O core processa uma nova utterance por vez:
 
 `KEEP_SILENCE` é uma saída normal e desejável.
 
+## Requisitos
+
+- Python 3.12+
+- Node.js e npm
+- `ffmpeg` no sistema para upload/captura de áudio comprimido
+- LM Studio rodando localmente para usar uma LLM
+
 ## Instalação Local
 
-### 1. Backend
+Rode a instalação a partir da raiz do repositório:
 
 ```bash
-cd backend
 python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[test,asr]"
-cp .env.example .env
+pip install -e "backend[test,asr]"
+npm --prefix frontend install
+cp backend/.env.example backend/.env
 ```
 
-### 2. LM Studio
-
-1. Abra o LM Studio.
-2. Baixe/carregue um modelo local.
-3. Inicie o servidor local OpenAI-compatible.
-4. Confirme que ele responde em `http://localhost:1234/v1/models`.
-5. Deixe `LLM_MODEL=` vazio para selecionar pela UI ou preencha com o model id.
-
-### 3. Iniciar Backend
+O extra `asr` instala o `faster-whisper`. Se você não for testar áudio agora, pode instalar apenas:
 
 ```bash
-cd backend
-source .venv/bin/activate
-uvicorn app.main:app --reload --port 8000
+pip install -e "backend[test]"
 ```
 
-Cheque:
+## Rodar Frontend e Backend Juntos
+
+Depois da instalação, suba tudo com um comando na raiz:
+
+```bash
+npm run dev
+```
+
+Esse comando inicia:
+
+- backend FastAPI em `http://localhost:8000`
+- frontend Vite em `http://localhost:5173`
+
+Cheque o backend em:
 
 ```bash
 curl http://localhost:8000/health
 ```
 
-### 4. Frontend
+Se precisar mudar a porta do backend:
+
+```bash
+BACKEND_PORT=8010 npm run dev
+```
+
+## Rodar Separado
+
+Backend:
+
+```bash
+cd backend
+../.venv/bin/python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Frontend:
 
 ```bash
 cd frontend
-npm install
 npm run dev
 ```
 
-Acesse `http://localhost:5173`.
+Se o backend estiver em outra URL, informe para o Vite:
+
+```bash
+VITE_API_URL=http://localhost:8010 npm --prefix frontend run dev
+```
+
+## Plugar a LLM com LM Studio
+
+1. Abra o LM Studio.
+2. Baixe e carregue um modelo local.
+3. Inicie o servidor local OpenAI-compatible.
+4. Confirme que ele responde em `http://localhost:1234/v1/models`.
+5. Edite `backend/.env` se precisar mudar a URL, chave ou modelo:
+
+```env
+LLM_BASE_URL=http://localhost:1234/v1
+LLM_API_KEY=lm-studio
+LLM_MODEL=
+```
+
+`LLM_MODEL` pode ficar vazio. Nesse caso, o backend lista os modelos carregados no LM Studio e o frontend permite selecionar um modelo na UI. Se quiser fixar um modelo, preencha `LLM_MODEL` com o `id` retornado por `/v1/models`.
+
+O backend usa endpoints OpenAI-compatible:
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+
+## Conectar com Google Meet
+
+O MVP não usa Google Meet API. A conexão é feita pela captura de aba do Chrome.
+
+1. Abra o Google Meet no Chrome.
+2. Entre em uma reunião de teste.
+3. Abra `http://localhost:5173`.
+4. Clique em `Start live meeting`.
+5. Na seleção do Chrome, escolha especificamente a aba do Google Meet.
+6. Marque o compartilhamento de áudio da aba.
+7. Autorize o microfone local.
+8. Observe eventos de áudio, transcrição, utterances e decisões na UI.
+
+O navegador envia dois fluxos:
+
+- `REMOTE_AUDIO`: áudio capturado da aba do Meet
+- `LOCAL_MIC_AUDIO`: áudio do seu microfone
+
+O backend rotula esses fluxos como `REMOTE` e `ME`. Diarização real por participante fica fora deste protótipo.
+
+## Conectar com Microsoft Teams
+
+Para Teams Web, use o mesmo caminho de captura de aba:
+
+1. Abra o Teams Web no Chrome.
+2. Entre em uma reunião de teste.
+3. Abra `http://localhost:5173`.
+4. Clique em `Start live meeting`.
+5. Na seleção do Chrome, escolha especificamente a aba do Teams.
+6. Marque o compartilhamento de áudio da aba.
+7. Autorize o microfone local.
+
+Não é necessário Microsoft Graph, registro de bot ou API nativa do Teams para este POC. Uma integração nativa futura deve substituir apenas a origem de mídia e emitir os mesmos eventos internos, principalmente `audio.chunk`, `transcript.partial` e `utterance.final`.
 
 ## Testar Replay
 
@@ -78,29 +161,10 @@ O backend nunca envia falas futuras ao prompt; há teste automatizado para isso.
 
 `ffmpeg` precisa estar disponível no sistema para formatos comprimidos.
 
-## Testar Google Meet
-
-1. Abra o Google Meet no Chrome.
-2. Entre em uma reunião de teste.
-3. Abra `http://localhost:5173`.
-4. Clique `Start live meeting`.
-5. Na seleção do Chrome, escolha especificamente a aba do Google Meet.
-6. Marque o compartilhamento de áudio da aba.
-7. Autorize o microfone local.
-8. Observe eventos de áudio, transcrição, utterances e decisões.
-
-O MVP usa captura de aba do Chrome, não Google Meet API.
-
-## Testar Teams Web
-
-Use o mesmo procedimento com uma aba do Microsoft Teams Web no Chrome. O core não conhece Teams ou Meet; ele recebe eventos genéricos como `utterance.final`.
-
 ## Benchmark
 
 ```bash
-cd backend
 source .venv/bin/activate
-cd ..
 python benchmarks/run_benchmark.py
 ```
 
@@ -120,7 +184,6 @@ No Docker, o backend usa por padrão `http://host.docker.internal:1234/v1`. Em L
 
 - `lm_studio: error`: inicie o servidor local no LM Studio e confirme a porta `1234`.
 - Nenhum modelo aparece: carregue um modelo no LM Studio antes de abrir o frontend.
-- ASR `unavailable`: instale com `pip install -e ".[asr]"` e confirme `ffmpeg`.
+- ASR `unavailable`: instale com `pip install -e "backend[asr]"` e confirme `ffmpeg`.
 - Captura de aba sem áudio: no Chrome, selecione uma aba, não janela/tela inteira, e marque compartilhar áudio.
-- Teams/Meet sem speaker real: o MVP separa `ME` para microfone local e `REMOTE` para áudio da aba; diarização perfeita fica fora deste protótipo.
-
+- Teams/Meet sem speaker real: o MVP separa `ME` para microfone local e `REMOTE` para áudio da aba.
