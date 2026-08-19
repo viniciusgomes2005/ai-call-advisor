@@ -1,0 +1,36 @@
+[project]
+name = "meeting-delegate-poc-backend"
+version = "0.1.0"
+description = "Experimental real-time Meeting Delegate POC"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.116.0",
+    "uvicorn[standard]>=0.35.0",
+    "pydantic>=2.11.0",
+    "pydantic-settings>=2.10.0",
+    "httpx>=0.28.0",
+    "python-dotenv>=1.1.0",
+    "python-multipart>=0.0.20",
+    "orjson>=3.10.0",
+    "numpy>=2.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[project.optional-dependencies]
+asr = ["faster-whisper>=1.1.0"]
+test = ["pytest>=8.4.0", "pytest-asyncio>=1.1.0", "respx>=0.22.0"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

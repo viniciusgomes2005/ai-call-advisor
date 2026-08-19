@@ -1,0 +1,24 @@
+{
+  "case_id": "chime-001",
+  "delegate": {
+    "name": "Bob",
+    "role": "Backend Engineer",
+    "meeting_intents": ["Understand the status of the voice feature"],
+    "shareable_information": [
+      {
+        "context": "When latency or performance is discussed",
+        "information": "Ask whether the service was tested under concurrent requests."
+      }
+    ]
+  },
+  "utterances": [
+    {"id": 1, "speaker": "Alice", "text": "The voice feature works in our local demo."},
+    {"id": 2, "speaker": "Carol", "text": "There are still latency spikes when people talk over each other."}
+  ],
+  "evaluation_at_utterance": 2,
+  "expected": {
+    "category": "CHIME_IN",
+    "key_points": ["latency", "concurrent requests"]
+  }
+}
+

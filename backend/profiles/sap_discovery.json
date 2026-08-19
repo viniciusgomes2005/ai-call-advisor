@@ -1,0 +1,17 @@
+{
+  "name": "SAP Discovery Copilot",
+  "role": "assistant to an SAP migration consultant",
+  "meeting_intents": [
+    "Identify the client's current ERP landscape",
+    "Identify relevant integrations",
+    "Identify unanswered discovery questions",
+    "Identify possible migration risks"
+  ],
+  "shareable_information": [
+    {
+      "context": "When an external system integrated with ECC is mentioned",
+      "information": "The consultant should understand interface type, data direction, frequency, volume and criticality."
+    }
+  ]
+}
+

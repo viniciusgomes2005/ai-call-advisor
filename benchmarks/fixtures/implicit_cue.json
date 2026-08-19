@@ -1,0 +1,24 @@
+{
+  "case_id": "implicit-001",
+  "delegate": {
+    "name": "Bob",
+    "role": "Backend Engineer",
+    "meeting_intents": ["Understand the status of the voice feature"],
+    "shareable_information": [
+      {
+        "context": "When backend integration is discussed",
+        "information": "The authentication integration was completed last week"
+      }
+    ]
+  },
+  "utterances": [
+    {"id": 1, "speaker": "Alice", "text": "The voice UI is ready for integration testing."},
+    {"id": 2, "speaker": "Carol", "text": "Does anyone from backend know if authentication is already integrated?"}
+  ],
+  "evaluation_at_utterance": 2,
+  "expected": {
+    "category": "IMPLICIT_CUE",
+    "key_points": ["authentication integration", "backend"]
+  }
+}
+

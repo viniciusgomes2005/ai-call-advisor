@@ -1,0 +1,32 @@
+{
+  "case_id": "sap-001",
+  "delegate": {
+    "name": "SAP Discovery Copilot",
+    "role": "assistant to an SAP migration consultant",
+    "meeting_intents": [
+      "Identify the client's current ERP landscape",
+      "Identify relevant integrations",
+      "Identify unanswered discovery questions",
+      "Identify possible migration risks"
+    ],
+    "shareable_information": [
+      {
+        "context": "When an external system integrated with ECC is mentioned",
+        "information": "The consultant should understand interface type, data direction, frequency, volume and criticality."
+      }
+    ]
+  },
+  "utterances": [
+    {
+      "id": 1,
+      "speaker": "Cliente",
+      "text": "Nosso estoque é controlado por um WMS externo que conversa com o ECC."
+    }
+  ],
+  "evaluation_at_utterance": 1,
+  "expected": {
+    "category": "CHIME_IN",
+    "key_points": ["WMS", "ECC", "interfaces"]
+  }
+}
+

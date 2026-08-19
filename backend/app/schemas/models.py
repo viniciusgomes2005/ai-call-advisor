@@ -1,0 +1,155 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from enum import StrEnum
+from typing import Any, Literal
+from uuid import uuid4
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class InterventionCategory(StrEnum):
+    EXPLICIT_CUE = "EXPLICIT_CUE"
+    IMPLICIT_CUE = "IMPLICIT_CUE"
+    CHIME_IN = "CHIME_IN"
+    KEEP_SILENCE = "KEEP_SILENCE"
+
+
+class ShareableInformation(BaseModel):
+    context: str
+    information: str
+
+
+class DelegateProfile(BaseModel):
+    name: str
+    role: str
+    meeting_intents: list[str] = Field(default_factory=list, alias="meeting_intent")
+    shareable_information: list[ShareableInformation] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
+class Utterance(BaseModel):
+    id: int
+    speaker: str
+    text: str
+    timestamp: datetime = Field(default_factory=utc_now)
+    source: Literal["REPLAY", "MANUAL", "REMOTE_AUDIO", "LOCAL_MIC_AUDIO", "FILE_AUDIO", "UNKNOWN"] = "UNKNOWN"
+
+    @field_validator("text")
+    @classmethod
+    def non_empty_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("utterance text cannot be empty")
+        return value
+
+
+class LLMDecision(BaseModel):
+    category: InterventionCategory
+    should_intervene: bool
+    confidence: float = Field(ge=0, le=1)
+    response: str | None = None
+    reason: str
+    trigger_utterance_ids: list[int] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_silence_contract(self) -> "LLMDecision":
+        if self.category == InterventionCategory.KEEP_SILENCE:
+            self.should_intervene = False
+            self.response = None
+        elif self.should_intervene and not self.response:
+            raise ValueError("intervention decisions require a response")
+        return self
+
+
+class InterventionDecision(LLMDecision):
+    utterance_id: int
+    timestamp: datetime = Field(default_factory=utc_now)
+    model: str | None = None
+    prompt_version: str = "intervention_v1"
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    llm_latency_ms: int | None = None
+    pipeline_latency_ms: int | None = None
+    stale: bool = False
+    displayed: bool = False
+    filtered: bool = False
+    filter_reason: str | None = None
+
+
+class PreviousIntervention(BaseModel):
+    timestamp: datetime = Field(default_factory=utc_now)
+    utterance_id: int
+    category: InterventionCategory
+    response: str
+
+
+class MeetingState(BaseModel):
+    meeting_id: str = Field(default_factory=lambda: str(uuid4()))
+    delegate: DelegateProfile
+    utterances: list[Utterance] = Field(default_factory=list)
+    recent_context: list[Utterance] = Field(default_factory=list)
+    summary: str = ""
+    previous_interventions: list[PreviousIntervention] = Field(default_factory=list)
+
+
+class ReplayRequest(BaseModel):
+    delegate: DelegateProfile
+    utterances: list[Utterance]
+    meeting_id: str | None = None
+    realtime_delay_ms: int = 0
+
+
+class ManualUtteranceRequest(BaseModel):
+    speaker: str = "UNKNOWN"
+    text: str
+    source: Literal["MANUAL", "REMOTE_AUDIO", "LOCAL_MIC_AUDIO", "FILE_AUDIO", "UNKNOWN"] = "MANUAL"
+
+
+class CreateMeetingRequest(BaseModel):
+    delegate: DelegateProfile
+    meeting_id: str | None = None
+
+
+class MeetingResponse(BaseModel):
+    meeting_id: str
+    delegate: DelegateProfile
+
+
+class ModelInfo(BaseModel):
+    id: str
+    owned_by: str | None = None
+
+
+class HealthResponse(BaseModel):
+    backend: Literal["ok"] = "ok"
+    lm_studio: Literal["ok", "error"]
+    model: str | None = None
+    asr: Literal["ok", "unavailable", "error"]
+    error: str | None = None
+
+
+class MeetingEvent(BaseModel):
+    type: str
+    meeting_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    timestamp: datetime = Field(default_factory=utc_now)
+
+
+class BenchmarkExpected(BaseModel):
+    category: InterventionCategory
+    key_points: list[str] = Field(default_factory=list)
+
+
+class BenchmarkCase(BaseModel):
+    case_id: str
+    delegate: DelegateProfile
+    utterances: list[Utterance]
+    evaluation_at_utterance: int
+    expected: BenchmarkExpected
+

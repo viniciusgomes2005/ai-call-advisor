@@ -1,0 +1,24 @@
+{
+  "case_id": "explicit-001",
+  "delegate": {
+    "name": "Bob",
+    "role": "Backend Engineer",
+    "meeting_intents": ["Understand the status of the voice feature"],
+    "shareable_information": [
+      {
+        "context": "When backend integration is discussed",
+        "information": "The authentication integration was completed last week"
+      }
+    ]
+  },
+  "utterances": [
+    {"id": 1, "speaker": "Alice", "text": "We finished the first pass of the voice UI."},
+    {"id": 2, "speaker": "Carol", "text": "Bob, can you confirm whether backend auth is ready?"}
+  ],
+  "evaluation_at_utterance": 2,
+  "expected": {
+    "category": "EXPLICIT_CUE",
+    "key_points": ["auth is ready", "completed last week"]
+  }
+}
+
