@@ -93,6 +93,20 @@ class MeetingEngine:
 
         result = await self.llm_provider.decide_intervention(prompt, self.model)
         pipeline_latency_ms = int((time.perf_counter() - pipeline_start) * 1000)
+        # Latency components are kept separate end-to-end (audio -> ASR -> assembly ->
+        # LLM pipeline) and only summed once here, so nothing is double-counted.
+        has_latency_data = any(
+            value is not None
+            for value in (utterance.audio_finalize_latency_ms, utterance.asr_latency_ms, utterance.assembly_latency_ms)
+        )
+        total_suggestion_latency_ms = (
+            (utterance.audio_finalize_latency_ms or 0)
+            + (utterance.asr_latency_ms or 0)
+            + int(utterance.assembly_latency_ms or 0)
+            + pipeline_latency_ms
+            if has_latency_data
+            else None
+        )
         decision = InterventionDecision(
             utterance_id=utterance.id,
             category=result.decision.category,
@@ -107,9 +121,10 @@ class MeetingEngine:
             output_tokens=result.output_tokens,
             llm_latency_ms=result.latency_ms,
             pipeline_latency_ms=pipeline_latency_ms,
-            total_suggestion_latency_ms=(
-                (utterance.audio_finalize_latency_ms or 0) + (utterance.asr_latency_ms or 0) + pipeline_latency_ms
-                if utterance.asr_latency_ms is not None or utterance.audio_finalize_latency_ms is not None
+            total_suggestion_latency_ms=total_suggestion_latency_ms,
+            intervention_latency_from_audio_end_ms=(
+                total_suggestion_latency_ms
+                if utterance.audio_finalize_latency_ms is not None and utterance.asr_latency_ms is not None
                 else None
             ),
             stale=pipeline_latency_ms / 1000 > self.max_suggestion_age_seconds,

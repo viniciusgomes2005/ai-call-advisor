@@ -25,6 +25,22 @@ class MeetingInsightType(StrEnum):
     DECISION = "DECISION"
 
 
+class AudioFinalizationReason(StrEnum):
+    """Why a SpeechSegmenter closed an audio chunk.
+
+    SILENCE and MANUAL_FLUSH/MEETING_END mark a real (or explicitly
+    requested) end of speech and are eligible to trigger semantic
+    utterance finalization. MAX_DURATION is an artificial acoustic cut
+    (ASR_MAX_UTTERANCE_MS) and must NOT be treated as the end of a
+    semantic utterance - the UtteranceAssembler keeps the buffer open.
+    """
+
+    SILENCE = "SILENCE"
+    MAX_DURATION = "MAX_DURATION"
+    MANUAL_FLUSH = "MANUAL_FLUSH"
+    MEETING_END = "MEETING_END"
+
+
 class ShareableInformation(BaseModel):
     context: str
     information: str
@@ -104,6 +120,7 @@ class InterventionDecision(LLMDecision):
     llm_latency_ms: int | None = None
     pipeline_latency_ms: int | None = None
     total_suggestion_latency_ms: int | None = None
+    intervention_latency_from_audio_end_ms: int | None = None
     stale: bool = False
     displayed: bool = False
     filtered: bool = False
@@ -223,6 +240,8 @@ class TranscriptSegment(BaseModel):
     text: str
     created_at: datetime = Field(default_factory=utc_now)
     asr_latency_ms: float | None = None
+    audio_finalize_latency_ms: float | None = None
+    finalization_reason: AudioFinalizationReason | None = None
     language: str | None = None
     confidence: float | None = None
 

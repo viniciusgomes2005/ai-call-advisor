@@ -15,6 +15,7 @@ from app.asr.provider import (
     should_ignore_transcript,
 )
 from app.asr.streaming import AudioQueueItem, FinalizedAudio, SpeechSegmenter, SpeechStarted
+from app.schemas import AudioFinalizationReason
 
 
 def test_transcript_filter_ignores_common_whisper_hallucination() -> None:
@@ -130,6 +131,36 @@ def test_speech_segmenter_emits_started_and_final_audio() -> None:
     assert len(final) == 1
     assert final[0].source == "MIC"
     assert final[0].duration_seconds > 0
+    assert final[0].finalization_reason == AudioFinalizationReason.SILENCE
+
+
+def test_speech_segmenter_flags_max_duration_cut_distinctly_from_silence() -> None:
+    segmenter = SpeechSegmenter(
+        min_speech_ms=100,
+        silence_end_ms=100,
+        max_utterance_ms=500,
+        rms_threshold=0.01,
+    )
+    speech = (np.ones(3200, dtype=np.int16) * 2000).tobytes()  # 200ms @ 16kHz, continuous (no silence)
+
+    events = []
+    for _ in range(3):  # 3 x 200ms = 600ms of uninterrupted speech, past the 500ms max_utterance_ms
+        events.extend(segmenter.push(AudioQueueItem(source="MIC", data=speech)))
+
+    final = [event for event in events if isinstance(event, FinalizedAudio)]
+    assert len(final) == 1
+    assert final[0].finalization_reason == AudioFinalizationReason.MAX_DURATION
+
+
+def test_speech_segmenter_flush_defaults_to_manual_flush_reason() -> None:
+    segmenter = SpeechSegmenter(min_speech_ms=100, silence_end_ms=100, max_utterance_ms=15_000, rms_threshold=0.01)
+    speech = (np.ones(3200, dtype=np.int16) * 2000).tobytes()
+    segmenter.push(AudioQueueItem(source="MIC", data=speech))
+
+    final = segmenter.flush("MIC")
+
+    assert final is not None
+    assert final.finalization_reason == AudioFinalizationReason.MANUAL_FLUSH
 
 
 async def test_audio_queue_preserves_chunk_order() -> None:

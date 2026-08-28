@@ -52,4 +52,5 @@ def make_engine(delegate: DelegateProfile, meeting_id: str | None = None, model:
         meeting_id=meeting_id,
         model=model or settings.llm_model or None,
         max_suggestion_age_seconds=settings.max_suggestion_age_seconds,
+        enable_structured_meeting_state=settings.enable_structured_meeting_state,
     )

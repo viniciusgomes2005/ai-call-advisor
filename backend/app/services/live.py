@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 
 from app.meeting import MeetingEngine
-from app.schemas import InterventionDecision, MeetingEvent, Utterance, utc_now
+from app.schemas import InterventionDecision, MeetingEvent, SemanticUtterance, Utterance, utc_now
 
 
 DecisionCallback = Callable[[InterventionDecision], Awaitable[None]]
@@ -52,6 +52,22 @@ class LiveMeetingSession:
             audio_finalize_latency_ms=audio_finalize_latency_ms,
         )
         self._next_utterance_id += 1
+        return await self._dispatch_utterance(utterance)
+
+    async def ingest_semantic_utterance(self, semantic: SemanticUtterance, speaker: str) -> Utterance:
+        """Ingest a finalized SemanticUtterance (the assembler's output).
+
+        This is the only path that should reach MeetingEngine/LLM in the live
+        pipeline - individual acoustic ASR fragments (transcript.segment /
+        semantic_utterance.updated) must never call this. Builds the Utterance
+        once and dispatches it exactly once, so there is no risk of the same
+        SemanticUtterance being both recorded and ingested.
+        """
+        utterance = MeetingEngine.utterance_from_semantic(semantic, speaker, self._next_utterance_id)
+        self._next_utterance_id += 1
+        return await self._dispatch_utterance(utterance)
+
+    async def _dispatch_utterance(self, utterance: Utterance) -> Utterance:
         if self.on_event:
             await self.on_event(
                 MeetingEvent(

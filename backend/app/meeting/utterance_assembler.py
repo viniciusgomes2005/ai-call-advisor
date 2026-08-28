@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
 
-from app.schemas import SemanticUtterance, TranscriptSegment
+from app.schemas import AudioFinalizationReason, SemanticUtterance, TranscriptSegment
 
 
 AssemblyReason = Literal[
@@ -50,6 +50,11 @@ class _Buffer:
     segments: list[TranscriptSegment]
     started_at: float
     updated_at: float
+    # Whether the buffer is eligible for the silence-timeout finalization delay.
+    # False right after a segment whose audio was cut artificially by
+    # ASR_MAX_UTTERANCE_MS (finalization_reason=MAX_DURATION) - such a cut is not
+    # the end of speech, so flush_expired() must not close the buffer for it.
+    pending_timeout: bool = True
 
 
 class TranscriptOrderingBuffer:
@@ -153,6 +158,7 @@ class UtteranceAssembler:
                 segments=[segment],
                 started_at=clock,
                 updated_at=clock,
+                pending_timeout=self._pending_timeout_for(segment),
             )
             self._buffers[source] = current
             semantic = self._semantic_from_segments(current.semantic_id, [segment], None, clock)
@@ -167,6 +173,7 @@ class UtteranceAssembler:
             current.segments.append(segment)
             current.segments.sort(key=lambda item: (item.start, item.end, item.id))
             current.updated_at = clock
+            current.pending_timeout = self._pending_timeout_for(segment)
             updated = self._semantic_from_segments(current.semantic_id, current.segments, None, clock)
             logs.append(AssemblyLog("utterance.segment.merged", self._log_payload(updated, segment_id=segment.id)))
             hard_reason = self._hard_limit_reason(current.segments)
@@ -183,6 +190,7 @@ class UtteranceAssembler:
             segments=[segment],
             started_at=clock,
             updated_at=clock,
+            pending_timeout=self._pending_timeout_for(segment),
         )
         self._buffers[source] = current
         updated = self._semantic_from_segments(current.semantic_id, [segment], None, clock)
@@ -193,10 +201,19 @@ class UtteranceAssembler:
         clock = now if now is not None else time.perf_counter()
         finalized: list[SemanticUtterance] = []
         for source, current in list(self._buffers.items()):
+            if not current.pending_timeout:
+                # Last segment was cut by an artificial acoustic limit (MAX_DURATION),
+                # not a real silence - keep the buffer open until real speech-end
+                # arrives, a hard limit is hit, or the meeting/source is flushed.
+                continue
             age_ms = int((clock - current.updated_at) * 1000)
             if age_ms >= self.config.finalization_delay_ms:
                 finalized.append(self._finalize(source, "silence_timeout", clock))
         return AssemblyResult(finalized=finalized)
+
+    @staticmethod
+    def _pending_timeout_for(segment: TranscriptSegment) -> bool:
+        return segment.finalization_reason != AudioFinalizationReason.MAX_DURATION
 
     def flush_source(self, source: str, reason: AssemblyReason = "manual_flush", *, now: float | None = None) -> AssemblyResult:
         if source not in self._buffers:
@@ -299,8 +316,16 @@ class UtteranceAssembler:
     ) -> SemanticUtterance:
         created_at = min((segment.created_at for segment in segments), default=datetime.now(timezone.utc))
         updated_at = max((segment.created_at for segment in segments), default=created_at)
-        latency_ms = max(0.0, (datetime.now(timezone.utc) - created_at).total_seconds() * 1000)
+        # Assembly latency is the overhead the assembler itself adds on top of ASR: the
+        # time between the *last* contributing segment arriving and the utterance being
+        # finalized (e.g. the UTTERANCE_FINALIZATION_DELAY_MS wait). Measuring from the
+        # first segment would double-count the entire speech duration already reflected
+        # in start/end and asr_latency_ms.
+        latency_ms = max(0.0, (datetime.now(timezone.utc) - updated_at).total_seconds() * 1000)
         asr_latencies = [segment.asr_latency_ms for segment in segments if segment.asr_latency_ms is not None]
+        audio_finalize_latencies = [
+            segment.audio_finalize_latency_ms for segment in segments if segment.audio_finalize_latency_ms is not None
+        ]
         return SemanticUtterance(
             id=semantic_id,
             source=segments[0].source,
@@ -312,7 +337,7 @@ class UtteranceAssembler:
             updated_at=updated_at,
             language=next((segment.language for segment in segments if segment.language), None),
             asr_latency_ms=max(asr_latencies) if asr_latencies else None,
-            audio_finalize_latency_ms=None,
+            audio_finalize_latency_ms=audio_finalize_latencies[-1] if audio_finalize_latencies else None,
             assembly_reason=reason,
             assembly_latency_ms=latency_ms if reason else None,
             segment_count=len(segments),
