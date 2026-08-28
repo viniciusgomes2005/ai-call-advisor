@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     asr_silence_end_ms: int = 450
     asr_max_utterance_ms: int = 6000
     asr_vad_rms_threshold: float = 0.012
+    utterance_assembly_enabled: bool = True
+    utterance_merge_max_gap_ms: int = 1200
+    utterance_hard_max_duration_ms: int = 20000
+    utterance_hard_max_chars: int = 500
+    utterance_finalization_delay_ms: int = 500
+    utterance_backlog_warning_threshold: int = 8
+    enable_structured_meeting_state: bool = False
     save_raw_audio: bool = False
     language: str = "pt"
 

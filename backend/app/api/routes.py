@@ -15,9 +15,11 @@ from fastapi import APIRouter, File, HTTPException, UploadFile, WebSocket, WebSo
 
 from app.api.dependencies import make_asr_provider, make_engine, make_llm_provider
 from app.asr.streaming import AudioQueueItem, FinalizedAudio, SpeechSegmenter, SpeechStarted
+from app.meeting.utterance_assembler import AssemblyResult, TranscriptOrderingBuffer, UtteranceAssembler, UtteranceAssemblerConfig
 from app.schemas import (
     ASRStatusResponse,
     ASRTranscriptionResponse,
+    AudioFinalizationReason,
     CreateMeetingRequest,
     DelegateProfile,
     HealthResponse,
@@ -26,6 +28,7 @@ from app.schemas import (
     MeetingEvent,
     MeetingResponse,
     ReplayRequest,
+    TranscriptSegment,
     Utterance,
 )
 from app.services.logger import EventLogger
@@ -254,10 +257,14 @@ async def upload_audio(meeting_id: str, file: Annotated[UploadFile, File()], spe
 async def live_ws(websocket: WebSocket):
     await websocket.accept()
     session: LiveMeetingSession | None = None
+    assembler: UtteranceAssembler | None = None
     settings = get_settings()
     audio_queue: asyncio.Queue[AudioQueueItem | None] = asyncio.Queue()
     segmenters: dict[str, SpeechSegmenter] = {}
     asr_tasks: set[asyncio.Task[None]] = set()
+    asr_sequence: dict[str, int] = {}
+    ordering_buffer = TranscriptOrderingBuffer()
+    assembly_flush_task: asyncio.Task[None] | None = None
     send_lock = asyncio.Lock()
     disconnected = False
     chunk_stats: dict[str, dict[str, int | float]] = {}
@@ -303,20 +310,95 @@ async def live_ws(websocket: WebSocket):
             )
         return segmenters[source]
 
-    async def transcribe_final_audio(final_audio: FinalizedAudio) -> None:
+    def check_backlog() -> None:
+        if not session or assembler is None:
+            return
+        pending_transcript_segments = ordering_buffer.pending_count() + assembler.pending_transcript_segments()
+        oldest_pending_segment_age_ms = max(
+            ordering_buffer.oldest_pending_age_ms(), assembler.oldest_pending_segment_age_ms()
+        )
+        if pending_transcript_segments <= settings.utterance_backlog_warning_threshold:
+            return
+        payload = {
+            "pending_audio_segments": audio_queue.qsize() + len(asr_tasks),
+            "pending_transcript_segments": pending_transcript_segments,
+            "oldest_pending_segment_age_ms": oldest_pending_segment_age_ms,
+            "threshold": settings.utterance_backlog_warning_threshold,
+        }
+        logger.warning("Utterance backlog above threshold: %s", payload)
+        log_audio_debug("backlog.warning", payload)
+
+    async def handle_assembly_result(result: AssemblyResult) -> None:
         if not session:
             return
+        meeting_id = session.engine.state.meeting_id
+        for entry in result.logs:
+            session.engine.event_logger.log_utterance_assembly_event(meeting_id, entry.event, entry.payload)
+        if result.updated:
+            await send_event(
+                MeetingEvent(
+                    type="semantic_utterance.updated",
+                    meeting_id=meeting_id,
+                    payload=result.updated.model_dump(mode="json"),
+                )
+            )
+        # Only a finalized SemanticUtterance is allowed to reach MeetingEngine/LLM -
+        # never an in-progress `updated` utterance or a raw transcript.segment.
+        for semantic in result.finalized:
+            session.engine.event_logger.log_semantic_utterance(meeting_id, semantic)
+            session.engine.event_logger.log_utterance_assembly_event(
+                meeting_id, "utterance.finalized", semantic.model_dump(mode="json")
+            )
+            await send_event(
+                MeetingEvent(type="semantic_utterance.final", meeting_id=meeting_id, payload=semantic.model_dump(mode="json"))
+            )
+            speaker = speaker_for_source(semantic.source)
+            utterance = await session.ingest_semantic_utterance(semantic, speaker)
+            await send_live_state(
+                {
+                    "utterance_count": utterance.id,
+                    "last_assembly_reason": semantic.assembly_reason,
+                    "last_assembly_latency_ms": semantic.assembly_latency_ms,
+                    "segments_per_utterance": semantic.segment_count,
+                    "last_transcript_empty": False,
+                }
+            )
+
+    async def assembly_flush_worker() -> None:
+        interval_seconds = max(0.05, settings.utterance_finalization_delay_ms / 1000 / 2)
+        while True:
+            try:
+                await asyncio.sleep(interval_seconds)
+                if not session or assembler is None:
+                    continue
+                result = assembler.flush_expired()
+                if result.finalized:
+                    await handle_assembly_result(result)
+                check_backlog()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                # This background task must keep running for the whole meeting - one bad
+                # tick (e.g. a transient logging/event error) must not silently kill the
+                # only thing that finalizes utterances after a real silence.
+                logger.exception("assembly_flush_worker tick failed")
+
+    async def transcribe_final_audio(final_audio: FinalizedAudio, sequence: int) -> None:
+        if not session or assembler is None:
+            return
         source = normalize_audio_source(final_audio.source)
-        speaker = speaker_for_source(source)
+        finalization_reason = str(final_audio.finalization_reason)
         asr_started = time.perf_counter()
         log_audio_debug(
             "asr.started",
             {
                 "source": source,
+                "sequence": sequence,
                 "duration_ms": int(final_audio.duration_seconds * 1000),
                 "bytes": len(final_audio.data),
                 "queue_size": audio_queue.qsize(),
                 "inflight_asr": len(asr_tasks),
+                "finalization_reason": finalization_reason,
             },
         )
         await send_event(
@@ -325,12 +407,15 @@ async def live_ws(websocket: WebSocket):
                 meeting_id=session.engine.state.meeting_id,
                 payload={
                     "source": source,
+                    "sequence": sequence,
                     "duration_ms": int(final_audio.duration_seconds * 1000),
                     "queue_size": audio_queue.qsize(),
                     "inflight_asr": len(asr_tasks),
+                    "finalization_reason": finalization_reason,
                 },
             )
         )
+        transcript_segments: list[TranscriptSegment] = []
         try:
             result = await make_asr_provider().transcribe_audio_chunk(
                 final_audio.data,
@@ -341,11 +426,13 @@ async def live_ws(websocket: WebSocket):
             asr_wall_latency_ms = int((time.perf_counter() - asr_started) * 1000)
             asr_latency_ms = result.processing_time_ms
             asr_queue_latency_ms = max(0, asr_wall_latency_ms - asr_latency_ms)
+            audio_finalize_latency_ms = int((asr_started - final_audio.finalized_at) * 1000)
             text = " ".join(segment.text for segment in result.segments).strip()
             metrics = {
                 "source": source,
+                "sequence": sequence,
                 "audio_duration_ms": int(final_audio.duration_seconds * 1000),
-                "audio_finalize_latency_ms": int((asr_started - final_audio.finalized_at) * 1000),
+                "audio_finalize_latency_ms": audio_finalize_latency_ms,
                 "asr_latency_ms": asr_latency_ms,
                 "asr_wall_latency_ms": asr_wall_latency_ms,
                 "asr_queue_latency_ms": asr_queue_latency_ms,
@@ -355,6 +442,7 @@ async def live_ws(websocket: WebSocket):
                 "model": result.model,
                 "device": result.device,
                 "compute_type": result.compute_type,
+                "finalization_reason": finalization_reason,
             }
             session.engine.event_logger.log_asr_metrics(session.engine.state.meeting_id, metrics)
             log_audio_debug("asr.completed", metrics)
@@ -365,7 +453,7 @@ async def live_ws(websocket: WebSocket):
                     payload=metrics,
                 )
             )
-            if not text:
+            if not result.segments:
                 await send_event(
                     MeetingEvent(
                         type="transcript.empty",
@@ -381,66 +469,82 @@ async def live_ws(websocket: WebSocket):
                     }
                 )
                 return
-            for index, segment in enumerate(result.segments, start=1):
-                session.engine.event_logger.log_transcript_segment(
-                    session.engine.state.meeting_id,
-                    segment,
-                    {
-                        "id": f"utt_pending_{index}",
-                        "speaker": speaker,
-                        "source": source,
-                        "asr_latency_ms": asr_latency_ms,
-                        "model": result.model,
-                    },
+            # Absolute meeting-timeline timestamps: this chunk started at
+            # final_audio.start_seconds, whisper's segment.start/end are relative to it.
+            for index, segment in enumerate(result.segments):
+                transcript_segments.append(
+                    TranscriptSegment(
+                        id=f"seg_{source.lower()}_{sequence}_{index}",
+                        source=source,
+                        start=final_audio.start_seconds + segment.start,
+                        end=final_audio.start_seconds + segment.end,
+                        text=segment.text,
+                        asr_latency_ms=asr_latency_ms,
+                        audio_finalize_latency_ms=audio_finalize_latency_ms,
+                        finalization_reason=final_audio.finalization_reason,
+                        language=segment.language or result.language,
+                        confidence=segment.confidence,
+                    )
                 )
-            utterance = await session.ingest_final_utterance(
-                speaker=speaker,
-                text=text,
-                source=source,
-                start=final_audio.start_seconds,
-                end=final_audio.end_seconds,
-                language=result.language,
-                asr_latency_ms=asr_latency_ms,
-                audio_finalize_latency_ms=metrics["audio_finalize_latency_ms"],
-            )
-            await send_live_state(
-                {
-                    "utterance_count": utterance.id,
-                    "last_asr_latency_ms": asr_latency_ms,
-                    "last_asr_queue_latency_ms": asr_queue_latency_ms,
-                    "last_transcript_empty": False,
-                }
-            )
         except Exception as exc:
             log_audio_debug(
                 "asr.error",
                 {
                     "source": source,
+                    "sequence": sequence,
                     "duration_ms": int(final_audio.duration_seconds * 1000),
                     "bytes": len(final_audio.data),
                     "error": str(exc),
                 },
             )
-            logger.exception("Live ASR failed for source=%s", source)
+            logger.exception("Live ASR failed for source=%s sequence=%s", source, sequence)
             await send_event(
                 MeetingEvent(
                     type="transcript.error",
                     meeting_id=session.engine.state.meeting_id,
-                    payload={"source": source, "error": str(exc)},
+                    payload={"source": source, "sequence": sequence, "error": str(exc)},
                 )
             )
+        finally:
+            # Whether ASR succeeded, failed, or returned nothing, this sequence number
+            # must be marked complete - otherwise a failed/empty chunk would block the
+            # ordering buffer forever for every later sequence of the same source.
+            ready_segments = ordering_buffer.push_batch(source, sequence, transcript_segments)
+            for segment in ready_segments:
+                session.engine.event_logger.log_transcript_segment(
+                    session.engine.state.meeting_id,
+                    segment,
+                    {"speaker": speaker_for_source(segment.source), "sequence": sequence},
+                )
+                session.engine.event_logger.log_transcript_event(
+                    session.engine.state.meeting_id, "transcript.segment.created", segment
+                )
+                await send_event(
+                    MeetingEvent(
+                        type="transcript.segment",
+                        meeting_id=session.engine.state.meeting_id,
+                        payload=segment.model_dump(mode="json"),
+                    )
+                )
+                await handle_assembly_result(assembler.push(segment))
+            check_backlog()
 
     def schedule_asr(final_audio: FinalizedAudio) -> None:
+        source = normalize_audio_source(final_audio.source)
+        sequence = asr_sequence.get(source, 0)
+        asr_sequence[source] = sequence + 1
         log_audio_debug(
             "asr.scheduled",
             {
-                "source": normalize_audio_source(final_audio.source),
+                "source": source,
+                "sequence": sequence,
                 "duration_ms": int(final_audio.duration_seconds * 1000),
                 "bytes": len(final_audio.data),
                 "queue_size": audio_queue.qsize(),
+                "finalization_reason": str(final_audio.finalization_reason),
             },
         )
-        task = asyncio.create_task(transcribe_final_audio(final_audio))
+        task = asyncio.create_task(transcribe_final_audio(final_audio, sequence))
         asr_tasks.add(task)
         task.add_done_callback(asr_tasks.discard)
 
@@ -450,7 +554,7 @@ async def live_ws(websocket: WebSocket):
             try:
                 if item is None:
                     for source, segmenter in list(segmenters.items()):
-                        final_audio = segmenter.flush(source)
+                        final_audio = segmenter.flush(source, reason=AudioFinalizationReason.MEETING_END)
                         if final_audio:
                             schedule_asr(final_audio)
                     return
@@ -510,6 +614,22 @@ async def live_ws(websocket: WebSocket):
                     max_llm_concurrency=get_settings().max_llm_concurrency,
                     llm_enabled=bool(message.get("llm_enabled", True)),
                     on_event=send_event,
+                )
+                assembler = UtteranceAssembler(
+                    UtteranceAssemblerConfig(
+                        enabled=settings.utterance_assembly_enabled,
+                        merge_max_gap_ms=settings.utterance_merge_max_gap_ms,
+                        hard_max_duration_ms=settings.utterance_hard_max_duration_ms,
+                        hard_max_chars=settings.utterance_hard_max_chars,
+                        finalization_delay_ms=settings.utterance_finalization_delay_ms,
+                    )
+                )
+                assembly_flush_task = asyncio.create_task(assembly_flush_worker())
+                logger.info(
+                    "Utterance assembly enabled=%s merge_max_gap_ms=%s finalization_delay_ms=%s",
+                    settings.utterance_assembly_enabled,
+                    settings.utterance_merge_max_gap_ms,
+                    settings.utterance_finalization_delay_ms,
                 )
                 logger.info(
                     "Live meeting started: meeting=%s model=%s llm_enabled=%s vad_threshold=%s silence_end_ms=%s",
@@ -593,7 +713,7 @@ async def live_ws(websocket: WebSocket):
                 )
             elif event_type == "audio.flush":
                 source = normalize_audio_source(message.get("source", "TAB_AUDIO"))
-                final_audio = segmenter_for(source).flush(source)
+                final_audio = segmenter_for(source).flush(source, reason=AudioFinalizationReason.MANUAL_FLUSH)
                 if final_audio:
                     schedule_asr(final_audio)
             elif event_type == "meeting.stop":
@@ -601,6 +721,12 @@ async def live_ws(websocket: WebSocket):
                 await worker_task
                 if asr_tasks:
                     await asyncio.gather(*asr_tasks, return_exceptions=True)
+                if assembly_flush_task:
+                    assembly_flush_task.cancel()
+                if assembler is not None:
+                    # Any buffer still open (e.g. mid-sentence, or artificially cut by
+                    # MAX_DURATION and never followed by a real silence) must not be lost.
+                    await handle_assembly_result(assembler.flush_all(reason="meeting_end"))
                 if session:
                     await session.drain()
                     await send_event(MeetingEvent(type="meeting.ended", meeting_id=session.engine.state.meeting_id))
@@ -610,8 +736,14 @@ async def live_ws(websocket: WebSocket):
         worker_task.cancel()
         if asr_tasks:
             await asyncio.gather(*asr_tasks, return_exceptions=True)
+        if assembly_flush_task:
+            assembly_flush_task.cancel()
+        if assembler is not None:
+            await handle_assembly_result(assembler.flush_all(reason="meeting_end"))
         if session:
             await session.drain()
     finally:
         if not worker_task.done():
             worker_task.cancel()
+        if assembly_flush_task and not assembly_flush_task.done():
+            assembly_flush_task.cancel()

@@ -16,6 +16,7 @@ from app.schemas import (
     MeetingQuestionResponse,
     MeetingState,
     PreviousIntervention,
+    SemanticUtterance,
     Utterance,
 )
 from app.services.logger import EventLogger
@@ -32,6 +33,7 @@ class MeetingEngine:
         meeting_id: str | None = None,
         model: str | None = None,
         max_suggestion_age_seconds: int = 15,
+        enable_structured_meeting_state: bool = False,
     ):
         self.state = MeetingState(meeting_id=meeting_id, delegate=delegate) if meeting_id else MeetingState(delegate=delegate)
         self.llm_provider = llm_provider
@@ -40,6 +42,7 @@ class MeetingEngine:
         self.deduplicator = deduplicator
         self.model = model
         self.max_suggestion_age_seconds = max_suggestion_age_seconds
+        self.enable_structured_meeting_state = enable_structured_meeting_state
         self._lock = asyncio.Lock()
         self.event_logger.start_session(self.state)
 
@@ -65,6 +68,7 @@ class MeetingEngine:
             self.state.utterances.append(utterance)
             insights = detect_meeting_insights(utterance)
             self.state.insights.extend(insights)
+            self._update_conversation_state(utterance, insights)
             self.context_manager.update_recent_context(self.state)
             self.event_logger.log_utterance(self.state.meeting_id, utterance)
             for insight in insights:
@@ -80,6 +84,7 @@ class MeetingEngine:
             self.state.utterances.append(utterance)
             insights = detect_meeting_insights(utterance)
             self.state.insights.extend(insights)
+            self._update_conversation_state(utterance, insights)
             self.context_manager.update_recent_context(self.state)
             self.event_logger.log_utterance(self.state.meeting_id, utterance)
             for insight in insights:
@@ -88,6 +93,20 @@ class MeetingEngine:
 
         result = await self.llm_provider.decide_intervention(prompt, self.model)
         pipeline_latency_ms = int((time.perf_counter() - pipeline_start) * 1000)
+        # Latency components are kept separate end-to-end (audio -> ASR -> assembly ->
+        # LLM pipeline) and only summed once here, so nothing is double-counted.
+        has_latency_data = any(
+            value is not None
+            for value in (utterance.audio_finalize_latency_ms, utterance.asr_latency_ms, utterance.assembly_latency_ms)
+        )
+        total_suggestion_latency_ms = (
+            (utterance.audio_finalize_latency_ms or 0)
+            + (utterance.asr_latency_ms or 0)
+            + int(utterance.assembly_latency_ms or 0)
+            + pipeline_latency_ms
+            if has_latency_data
+            else None
+        )
         decision = InterventionDecision(
             utterance_id=utterance.id,
             category=result.decision.category,
@@ -102,9 +121,10 @@ class MeetingEngine:
             output_tokens=result.output_tokens,
             llm_latency_ms=result.latency_ms,
             pipeline_latency_ms=pipeline_latency_ms,
-            total_suggestion_latency_ms=(
-                (utterance.audio_finalize_latency_ms or 0) + (utterance.asr_latency_ms or 0) + pipeline_latency_ms
-                if utterance.asr_latency_ms is not None or utterance.audio_finalize_latency_ms is not None
+            total_suggestion_latency_ms=total_suggestion_latency_ms,
+            intervention_latency_from_audio_end_ms=(
+                total_suggestion_latency_ms
+                if utterance.audio_finalize_latency_ms is not None and utterance.asr_latency_ms is not None
                 else None
             ),
             stale=pipeline_latency_ms / 1000 > self.max_suggestion_age_seconds,
@@ -123,6 +143,54 @@ class MeetingEngine:
             self.event_logger.log_decision(self.state.meeting_id, decision)
             self.event_logger.save_state(self.state)
         return decision
+
+    async def record_semantic_utterance(
+        self, semantic: SemanticUtterance, speaker: str, utterance_id: int
+    ) -> tuple[Utterance, list[MeetingInsight]]:
+        utterance = self.utterance_from_semantic(semantic, speaker, utterance_id)
+        insights = await self.record_utterance(utterance)
+        return utterance, insights
+
+    async def ingest_semantic_utterance(
+        self, semantic: SemanticUtterance, speaker: str, utterance_id: int
+    ) -> tuple[Utterance, InterventionDecision]:
+        utterance = self.utterance_from_semantic(semantic, speaker, utterance_id)
+        decision = await self.ingest_utterance(utterance)
+        return utterance, decision
+
+    @staticmethod
+    def utterance_from_semantic(semantic: SemanticUtterance, speaker: str, utterance_id: int) -> Utterance:
+        return Utterance(
+            id=utterance_id,
+            speaker=speaker,
+            text=semantic.text,
+            source=semantic.source,  # type: ignore[arg-type]
+            start=semantic.start,
+            end=semantic.end,
+            language=semantic.language,
+            asr_latency_ms=int(semantic.asr_latency_ms) if semantic.asr_latency_ms is not None else None,
+            audio_finalize_latency_ms=(
+                int(semantic.audio_finalize_latency_ms) if semantic.audio_finalize_latency_ms is not None else None
+            ),
+            semantic_id=semantic.id,
+            segment_ids=list(semantic.segment_ids),
+            assembly_reason=semantic.assembly_reason,
+            assembly_latency_ms=semantic.assembly_latency_ms,
+        )
+
+    def _update_conversation_state(self, utterance: Utterance, insights: list[MeetingInsight]) -> None:
+        if not self.enable_structured_meeting_state:
+            return
+        state = self.state.conversation_state
+        text = utterance.text.strip()
+        if text and text not in state.facts:
+            state.facts.append(text)
+            state.facts = state.facts[-50:]
+        for insight in insights:
+            if insight.type == "OPEN_QUESTION" and insight.text not in state.open_questions:
+                state.open_questions.append(insight.text)
+            elif insight.type == "DECISION" and insight.text not in state.decisions:
+                state.decisions.append(insight.text)
 
     def insights_for_utterance(self, utterance_id: int) -> list[MeetingInsight]:
         return [insight for insight in self.state.insights if insight.utterance_id == utterance_id]

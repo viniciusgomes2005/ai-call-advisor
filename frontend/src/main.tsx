@@ -75,6 +75,22 @@ type LiveEvent = {
   meeting_id?: string | null;
   payload: Record<string, any>;
 };
+type TranscriptSegmentDebug = {
+  id: string;
+  source: string;
+  text: string;
+  start: number;
+  end: number;
+};
+type SemanticUtteranceDebug = {
+  id: string;
+  source: string;
+  text: string;
+  segment_ids: string[];
+  assembly_reason: string | null;
+  assembly_latency_ms: number | null;
+  final: boolean;
+};
 
 const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 const WS = API.replace(/^http/, "ws");
@@ -115,6 +131,9 @@ function App() {
   const [decisions, setDecisions] = useState<Decision[]>([]);
   const [insights, setInsights] = useState<MeetingInsight[]>([]);
   const [debug, setDebug] = useState<Record<string, string | number>>({});
+  const [showDebugSegments, setShowDebugSegments] = useState(false);
+  const [debugTranscriptSegments, setDebugTranscriptSegments] = useState<TranscriptSegmentDebug[]>([]);
+  const [debugSemanticUtterances, setDebugSemanticUtterances] = useState<SemanticUtteranceDebug[]>([]);
   const [liveActive, setLiveActive] = useState(false);
   const [llmEnabled, setLlmEnabled] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -195,6 +214,8 @@ function App() {
     setDecisions([]);
     setInsights([]);
     setDebug({});
+    setDebugTranscriptSegments([]);
+    setDebugSemanticUtterances([]);
     setAsrProcessing(0);
     setLastTranscriptEmpty(false);
     setManualText("");
@@ -217,6 +238,8 @@ function App() {
     setDecisions([]);
     setInsights([]);
     setDebug({});
+    setDebugTranscriptSegments([]);
+    setDebugSemanticUtterances([]);
     setAsrProcessing(0);
     setLastTranscriptEmpty(false);
 
@@ -292,6 +315,34 @@ function App() {
       if (typeof event.payload.last_transcript_empty === "boolean") {
         setLastTranscriptEmpty(event.payload.last_transcript_empty);
       }
+      if (event.payload.last_assembly_reason) {
+        setDebug((prev) => ({ ...prev, "Assembly motivo": String(event.payload.last_assembly_reason) }));
+      }
+      if (typeof event.payload.last_assembly_latency_ms === "number") {
+        setDebug((prev) => ({ ...prev, "Assembly latencia": `${Math.round(event.payload.last_assembly_latency_ms)} ms` }));
+      }
+      if (typeof event.payload.segments_per_utterance === "number") {
+        setDebug((prev) => ({ ...prev, "Segmentos/utterance": String(event.payload.segments_per_utterance) }));
+      }
+    }
+    if (event.type === "transcript.segment") {
+      const segment = event.payload as TranscriptSegmentDebug;
+      setDebugTranscriptSegments((prev) => [...prev.slice(-49), segment]);
+    }
+    if (event.type === "semantic_utterance.updated" || event.type === "semantic_utterance.final") {
+      const semantic: SemanticUtteranceDebug = {
+        id: event.payload.id,
+        source: event.payload.source,
+        text: event.payload.text,
+        segment_ids: event.payload.segment_ids ?? [],
+        assembly_reason: event.payload.assembly_reason ?? null,
+        assembly_latency_ms: event.payload.assembly_latency_ms ?? null,
+        final: event.type === "semantic_utterance.final",
+      };
+      setDebugSemanticUtterances((prev) => {
+        const withoutCurrent = prev.filter((item) => item.id !== semantic.id);
+        return [...withoutCurrent.slice(-49), semantic];
+      });
     }
     if (event.type === "asr.started") {
       setAsrProcessing((count) => count + 1);
@@ -656,9 +707,19 @@ function App() {
             <span className="eyebrow">Transcript</span>
             <h2>Ao vivo</h2>
           </div>
-          <button className="iconButton" onClick={resetSession} title="Limpar sessao">
-            <RotateCcw size={18} />
-          </button>
+          <div className="railActions">
+            <button
+              className={showDebugSegments ? "iconButton isActive" : "iconButton"}
+              onClick={() => setShowDebugSegments((value) => !value)}
+              title="Show ASR segments"
+              aria-pressed={showDebugSegments}
+            >
+              <SlidersHorizontal size={16} />
+            </button>
+            <button className="iconButton" onClick={resetSession} title="Limpar sessao">
+              <RotateCcw size={18} />
+            </button>
+          </div>
         </header>
 
         <div className="transcriptList">
@@ -692,6 +753,53 @@ function App() {
             </article>
           ))}
         </div>
+
+        {showDebugSegments && (
+          <section className="debugPanel">
+            <div className="debugPanelHeader">
+              <span>ASR debug</span>
+              <small>{debugTranscriptSegments.length} segmentos / {debugSemanticUtterances.length} utterances</small>
+            </div>
+            <div className="debugColumns">
+              <div className="debugColumn">
+                <strong>TranscriptSegment</strong>
+                {debugTranscriptSegments.length === 0 && <small>Nenhum segmento ainda</small>}
+                {debugTranscriptSegments
+                  .slice(-12)
+                  .reverse()
+                  .map((segment) => (
+                    <article key={segment.id} className="debugItem">
+                      <code>#{segment.id}</code>
+                      <p>{segment.text}</p>
+                      <small>
+                        {sourceLabel(segment.source)} · {segment.start.toFixed(2)}s - {segment.end.toFixed(2)}s
+                      </small>
+                    </article>
+                  ))}
+              </div>
+              <div className="debugColumn">
+                <strong>SemanticUtterance</strong>
+                {debugSemanticUtterances.length === 0 && <small>Nenhuma utterance semantica ainda</small>}
+                {debugSemanticUtterances
+                  .slice(-12)
+                  .reverse()
+                  .map((semantic) => (
+                    <article key={semantic.id} className={semantic.final ? "debugItem final" : "debugItem"}>
+                      <code>#{semantic.id}</code>
+                      <p>{semantic.text}</p>
+                      <small>
+                        {sourceLabel(semantic.source)} · {semantic.segment_ids.length} segmento(s)
+                        {semantic.assembly_reason ? ` · ${semantic.assembly_reason}` : ""}
+                        {typeof semantic.assembly_latency_ms === "number"
+                          ? ` · ${Math.round(semantic.assembly_latency_ms)} ms`
+                          : ""}
+                      </small>
+                    </article>
+                  ))}
+              </div>
+            </div>
+          </section>
+        )}
 
         {llmEnabled && (
           <section className="advisorPanel">

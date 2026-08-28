@@ -25,6 +25,22 @@ class MeetingInsightType(StrEnum):
     DECISION = "DECISION"
 
 
+class AudioFinalizationReason(StrEnum):
+    """Why a SpeechSegmenter closed an audio chunk.
+
+    SILENCE and MANUAL_FLUSH/MEETING_END mark a real (or explicitly
+    requested) end of speech and are eligible to trigger semantic
+    utterance finalization. MAX_DURATION is an artificial acoustic cut
+    (ASR_MAX_UTTERANCE_MS) and must NOT be treated as the end of a
+    semantic utterance - the UtteranceAssembler keeps the buffer open.
+    """
+
+    SILENCE = "SILENCE"
+    MAX_DURATION = "MAX_DURATION"
+    MANUAL_FLUSH = "MANUAL_FLUSH"
+    MEETING_END = "MEETING_END"
+
+
 class ShareableInformation(BaseModel):
     context: str
     information: str
@@ -62,6 +78,10 @@ class Utterance(BaseModel):
     language: str | None = None
     asr_latency_ms: int | None = None
     audio_finalize_latency_ms: int | None = None
+    semantic_id: str | None = None
+    segment_ids: list[str] = Field(default_factory=list)
+    assembly_reason: str | None = None
+    assembly_latency_ms: float | None = None
 
     @field_validator("text")
     @classmethod
@@ -100,6 +120,7 @@ class InterventionDecision(LLMDecision):
     llm_latency_ms: int | None = None
     pipeline_latency_ms: int | None = None
     total_suggestion_latency_ms: int | None = None
+    intervention_latency_from_audio_end_ms: int | None = None
     stale: bool = False
     displayed: bool = False
     filtered: bool = False
@@ -132,6 +153,7 @@ class MeetingState(BaseModel):
     summary: str = ""
     previous_interventions: list[PreviousIntervention] = Field(default_factory=list)
     insights: list[MeetingInsight] = Field(default_factory=list)
+    conversation_state: "ConversationState" = Field(default_factory=lambda: ConversationState())
 
 
 class ReplayRequest(BaseModel):
@@ -202,12 +224,43 @@ class HealthResponse(BaseModel):
     error: str | None = None
 
 
+class ConversationState(BaseModel):
+    current_topics: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
+    facts: list[str] = Field(default_factory=list)
+    decisions: list[str] = Field(default_factory=list)
+    entities: list[str] = Field(default_factory=list)
+
+
 class TranscriptSegment(BaseModel):
+    id: str = Field(default_factory=lambda: f"seg_{uuid4().hex}")
+    source: str = "UNKNOWN"
     start: float
     end: float
     text: str
+    created_at: datetime = Field(default_factory=utc_now)
+    asr_latency_ms: float | None = None
+    audio_finalize_latency_ms: float | None = None
+    finalization_reason: AudioFinalizationReason | None = None
     language: str | None = None
     confidence: float | None = None
+
+
+class SemanticUtterance(BaseModel):
+    id: str = Field(default_factory=lambda: f"utt_{uuid4().hex}")
+    source: str
+    text: str
+    start: float
+    end: float
+    segment_ids: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    language: str | None = None
+    asr_latency_ms: float | None = None
+    audio_finalize_latency_ms: float | None = None
+    assembly_reason: str | None = None
+    assembly_latency_ms: float | None = None
+    segment_count: int = 0
 
 
 class ASRTranscriptionResponse(BaseModel):
