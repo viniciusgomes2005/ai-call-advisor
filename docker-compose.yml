@@ -9,9 +9,12 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:1234/v1}
       LLM_API_KEY: ${LLM_API_KEY:-lm-studio}
       LLM_MODEL: ${LLM_MODEL:-}
-      WHISPER_MODEL: ${WHISPER_MODEL:-small}
+      WHISPER_MODEL: ${WHISPER_MODEL:-large-v3-turbo}
       WHISPER_DEVICE: ${WHISPER_DEVICE:-auto}
       WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-auto}
+      WHISPER_LANGUAGE: ${WHISPER_LANGUAGE:-}
+      ASR_LOAD_ON_STARTUP: ${ASR_LOAD_ON_STARTUP:-true}
+      SAVE_RAW_AUDIO: ${SAVE_RAW_AUDIO:-false}
       LANGUAGE: ${LANGUAGE:-pt}
     volumes:
       - ./data:/app/data
@@ -28,4 +31,3 @@ services:
       VITE_API_URL: http://localhost:8000
     depends_on:
       - backend
-

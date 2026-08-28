@@ -22,15 +22,9 @@ Rode a instalação a partir da raiz do repositório:
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -e "backend[test,asr]"
+pip install -e "backend[test]"
 npm --prefix frontend install
 cp backend/.env.example backend/.env
-```
-
-O extra `asr` instala o `faster-whisper`. Se você não for testar áudio agora, pode instalar apenas:
-
-```bash
-pip install -e "backend[test]"
 ```
 
 ## Rodar Frontend e Backend Juntos
@@ -100,6 +94,97 @@ O backend usa endpoints OpenAI-compatible:
 
 - `GET /v1/models`
 - `POST /v1/chat/completions`
+
+## Local Speech Recognition
+
+O ASR roda localmente com `faster-whisper`; o LM Studio continua sendo usado só para o LLM.
+
+Instalação:
+
+```bash
+source .venv/bin/activate
+pip install -e "backend[test]"
+```
+
+Configuração principal em `backend/.env`:
+
+```env
+WHISPER_MODEL=large-v3-turbo
+WHISPER_DEVICE=auto
+WHISPER_COMPUTE_TYPE=auto
+WHISPER_LANGUAGE=
+ASR_MIN_SPEECH_MS=500
+ASR_SILENCE_END_MS=600
+ASR_MAX_UTTERANCE_MS=15000
+SAVE_RAW_AUDIO=false
+```
+
+Com `WHISPER_LANGUAGE=` vazio, o Whisper detecta o idioma automaticamente. Para forçar, use `pt` ou `en`.
+
+Hardware:
+
+- CPU local: deixe `WHISPER_DEVICE=auto`; sem CUDA detectado, o backend usa `cpu` com `int8`.
+- CUDA local: com driver NVIDIA e `nvidia-smi` disponível, `auto` usa `cuda` com `float16`.
+- Docker CPU: funciona com a imagem padrão.
+- Docker CUDA: requer NVIDIA Container Toolkit e configuração adicional de runtime GPU; o modo local sem Docker é o caminho prioritário.
+
+Verificar status:
+
+```bash
+curl http://localhost:8000/api/asr/status
+```
+
+Testar arquivo:
+
+```bash
+curl -F "file=@sample.wav" http://localhost:8000/api/asr/transcribe
+```
+
+A resposta inclui `language`, `segments`, `processing_time_ms`, `audio_duration_seconds` e `real_time_factor`.
+
+Na UI, use `Upload WAV/MP3/M4A/WEBM` para validar o Whisper sem criar uma reunião. A seção `Speech Recognition` mostra provider, modelo, device, status, idioma e latência ASR.
+
+Teste com microfone:
+
+1. Abra o frontend.
+2. Clique `Start live meeting`.
+3. Autorize captura da aba e microfone.
+4. Fale uma frase como `Atualmente utilizamos SAP ECC integrado a um WMS externo.`
+5. Ao parar de falar, o backend finaliza uma utterance por silêncio e mostra a latência.
+
+Google Meet e Teams Web usam a mesma estratégia: escolha a aba do Meet/Teams no seletor do Chrome e habilite o áudio da aba. O frontend envia `TAB_AUDIO` para áudio remoto e `MIC` para o microfone local, permitindo mapear `TAB_AUDIO -> REMOTE` e `MIC -> ME` sem diarização.
+
+Logs por sessão ficam em:
+
+```text
+backend/data/sessions/{session_id}/
+```
+
+Arquivos gerados:
+
+- `audio_metadata.json`
+- `transcript.jsonl`
+- `utterances.jsonl`
+- `asr_metrics.jsonl`
+- `decisions.jsonl`
+
+Áudio bruto não é salvo por padrão.
+
+Troubleshooting:
+
+- CUDA não detectado: confirme `nvidia-smi`, driver NVIDIA e compatibilidade do CTranslate2.
+- Falta de VRAM: use `WHISPER_COMPUTE_TYPE=int8_float16` ou `WHISPER_DEVICE=cpu`.
+- Modelo não encontrado: rode com internet na primeira carga para baixar do Hugging Face.
+- Permissão de microfone: confira permissões do Chrome para `localhost`.
+- Aba sem áudio: selecione uma aba específica, não janela/tela inteira, e marque compartilhar áudio.
+- Linux/PipeWire: confirme que o Chrome consegue capturar áudio da aba e que o microfone aparece no seletor do sistema.
+
+Benchmark ASR:
+
+```bash
+python benchmarks/run_asr_benchmark.py --audio sample.wav --model large-v3-turbo
+python benchmarks/run_asr_benchmark.py --audio sample.wav --model large-v3-turbo --domain-prompt
+```
 
 ## Conectar com Google Meet
 
@@ -267,6 +352,6 @@ No Docker, o backend usa por padrão `http://host.docker.internal:1234/v1`. Em L
 
 - `lm_studio: error`: inicie o servidor local no LM Studio e confirme a porta `1234`.
 - Nenhum modelo aparece: carregue um modelo no LM Studio antes de abrir o frontend.
-- ASR `unavailable`: instale com `pip install -e "backend[asr]"` e confirme `ffmpeg`.
+- ASR `unavailable`: instale com `pip install -e "backend[test]"` e confirme `ffmpeg`/PyAV.
 - Captura de aba sem áudio: no Chrome, selecione uma aba, não janela/tela inteira, e marque compartilhar áudio.
 - Teams/Meet sem speaker real: o MVP separa `ME` para microfone local e `REMOTE` para áudio da aba.

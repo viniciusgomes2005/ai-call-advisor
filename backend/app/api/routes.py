@@ -3,15 +3,21 @@ from __future__ import annotations
 import base64
 import asyncio
 import json
+import logging
 import tempfile
+import time
 from pathlib import Path
 from typing import Annotated
+from uuid import uuid4
 
 import httpx
 from fastapi import APIRouter, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 
 from app.api.dependencies import make_asr_provider, make_engine, make_llm_provider
+from app.asr.streaming import AudioQueueItem, FinalizedAudio, SpeechSegmenter, SpeechStarted
 from app.schemas import (
+    ASRStatusResponse,
+    ASRTranscriptionResponse,
     CreateMeetingRequest,
     DelegateProfile,
     HealthResponse,
@@ -22,12 +28,28 @@ from app.schemas import (
     ReplayRequest,
     Utterance,
 )
+from app.services.logger import EventLogger
 from app.services.live import LiveMeetingSession
 from app.services.replay import ReplayService
 from app.settings import get_settings
 
 router = APIRouter()
 ENGINES = {}
+logger = logging.getLogger(__name__)
+
+
+def speaker_for_source(source: str) -> str:
+    return "ME" if source in {"MIC", "LOCAL_MIC", "LOCAL_MIC_AUDIO"} else "REMOTE"
+
+
+def normalize_audio_source(source: str) -> str:
+    if source in {"LOCAL_MIC", "LOCAL_MIC_AUDIO"}:
+        return "MIC"
+    if source in {"REMOTE_AUDIO", "REMOTE"}:
+        return "TAB_AUDIO"
+    if source in {"MIC", "TAB_AUDIO", "FILE"}:
+        return source
+    return "UNKNOWN"
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -41,6 +63,65 @@ async def health() -> HealthResponse:
         return HealthResponse(lm_studio="ok", model=selected, asr=asr.status())
     except (httpx.HTTPError, OSError) as exc:
         return HealthResponse(lm_studio="error", model=settings.llm_model or None, asr=asr.status(), error=str(exc))
+
+
+@router.get("/api/asr/status", response_model=ASRStatusResponse)
+async def asr_status() -> ASRStatusResponse:
+    return make_asr_provider().status_payload()
+
+
+@router.post("/api/asr/transcribe", response_model=ASRTranscriptionResponse)
+async def transcribe_audio_file(file: Annotated[UploadFile, File()], language: str | None = None):
+    suffix = Path(file.filename or "audio.wav").suffix.lower() or ".wav"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp:
+        temp.write(await file.read())
+        path = Path(temp.name)
+    try:
+        settings = get_settings()
+        result = await make_asr_provider().transcribe_file(path, language=language or settings.whisper_language)
+        session_id = str(uuid4())
+        logger = EventLogger(settings.data_dir)
+        logger.save_audio_metadata(
+            session_id,
+            {
+                "filename": file.filename,
+                "source": "FILE",
+                "content_type": file.content_type,
+                "audio_duration_seconds": result.audio_duration_seconds,
+                "save_raw_audio": settings.save_raw_audio,
+            },
+        )
+        for index, segment in enumerate(result.segments, start=1):
+            logger.log_transcript_segment(
+                session_id,
+                segment,
+                {
+                    "id": f"seg_{index}",
+                    "speaker": None,
+                    "source": "FILE",
+                    "asr_latency_ms": result.processing_time_ms,
+                    "model": result.model,
+                },
+            )
+        logger.log_asr_metrics(
+            session_id,
+            {
+                "source": "FILE",
+                "audio_duration_ms": int((result.audio_duration_seconds or 0) * 1000),
+                "asr_latency_ms": result.processing_time_ms,
+                "real_time_factor": result.real_time_factor,
+                "model": result.model,
+                "device": result.device,
+                "compute_type": result.compute_type,
+            },
+        )
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Whisper transcription failed: {exc}") from exc
+    finally:
+        path.unlink(missing_ok=True)
 
 
 @router.get("/models")
@@ -109,61 +190,238 @@ async def upload_audio(meeting_id: str, file: Annotated[UploadFile, File()], spe
         path = Path(temp.name)
     try:
         asr = make_asr_provider()
-        segments = await asr.process_audio_file(path, language=get_settings().language, speaker=speaker)
+        settings = get_settings()
+        result = await asr.transcribe_file(path, language=settings.whisper_language)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Whisper transcription failed: {exc}") from exc
     finally:
         path.unlink(missing_ok=True)
     outputs = []
-    for segment in segments:
+    engine.event_logger.save_audio_metadata(
+        engine.state.meeting_id,
+        {
+            "filename": file.filename,
+            "source": "FILE",
+            "content_type": file.content_type,
+            "save_raw_audio": get_settings().save_raw_audio,
+        },
+    )
+    engine.event_logger.log_asr_metrics(
+        engine.state.meeting_id,
+        {
+            "source": "FILE",
+            "audio_duration_ms": int((result.audio_duration_seconds or 0) * 1000),
+            "asr_latency_ms": result.processing_time_ms,
+            "real_time_factor": result.real_time_factor,
+            "model": result.model,
+            "device": result.device,
+            "compute_type": result.compute_type,
+        },
+    )
+    for segment in result.segments:
+        engine.event_logger.log_transcript_segment(
+            engine.state.meeting_id,
+            segment,
+            {"speaker": speaker, "source": "FILE", "asr_latency_ms": result.processing_time_ms, "model": result.model},
+        )
         utterance = Utterance(
             id=max((u.id for u in engine.state.utterances), default=0) + 1,
-            speaker=segment.speaker,
+            speaker=speaker,
             text=segment.text,
-            source="FILE_AUDIO",
+            source="FILE",
+            start=segment.start,
+            end=segment.end,
+            language=segment.language,
+            asr_latency_ms=result.processing_time_ms,
         )
         decision = await engine.ingest_utterance(utterance)
         outputs.append(
             {
                 "utterance": utterance.model_dump(mode="json"),
                 "decision": decision.model_dump(mode="json"),
-                "insights": [insight.model_dump(mode="json") for insight in engine.insights_for_utterance(utterance.id)],
+                "insights": [
+                    insight.model_dump(mode="json") for insight in engine.insights_for_utterance(utterance.id)
+                ],
             }
         )
     return {"segments": outputs}
 
 
+@router.websocket("/ws/audio")
 @router.websocket("/ws/live")
 async def live_ws(websocket: WebSocket):
     await websocket.accept()
     session: LiveMeetingSession | None = None
-    audio_buffers: dict[str, bytearray] = {"REMOTE_AUDIO": bytearray(), "LOCAL_MIC_AUDIO": bytearray()}
-    transcription_tasks: set[asyncio.Task] = set()
+    settings = get_settings()
+    audio_queue: asyncio.Queue[AudioQueueItem | None] = asyncio.Queue()
+    segmenters: dict[str, SpeechSegmenter] = {}
+    asr_tasks: set[asyncio.Task[None]] = set()
     send_lock = asyncio.Lock()
+    disconnected = False
+    chunk_stats: dict[str, dict[str, int | float]] = {}
+
+    def current_meeting_id() -> str | None:
+        return session.engine.state.meeting_id if session else None
+
+    def log_audio_debug(kind: str, payload: dict) -> None:
+        meeting_id = current_meeting_id()
+        event = {"event": kind, "timestamp": time.time(), **payload}
+        logger.info("live audio debug: meeting=%s event=%s payload=%s", meeting_id or "-", kind, payload)
+        if session and meeting_id:
+            session.engine.event_logger.log_audio_debug(meeting_id, event)
+
+    async def send_live_state(payload: dict) -> None:
+        if not session:
+            return
+        await send_event(
+            MeetingEvent(
+                type="meeting.state.updated",
+                meeting_id=session.engine.state.meeting_id,
+                payload=payload,
+            )
+        )
 
     async def send_event(event: MeetingEvent) -> None:
-        async with send_lock:
-            await websocket.send_json(event.model_dump(mode="json"))
-
-    async def transcribe_buffer(source: str, data: bytes) -> None:
-        if not session or not data:
+        nonlocal disconnected
+        if disconnected:
             return
-        speaker = "ME" if source == "LOCAL_MIC_AUDIO" else "REMOTE"
-        try:
-            segments = await make_asr_provider().process_audio(
-                data,
-                suffix=".webm",
-                language=get_settings().language,
-                speaker=speaker,
+        async with send_lock:
+            try:
+                await websocket.send_json(event.model_dump(mode="json"))
+            except (RuntimeError, WebSocketDisconnect):
+                disconnected = True
+
+    def segmenter_for(source: str) -> SpeechSegmenter:
+        if source not in segmenters:
+            segmenters[source] = SpeechSegmenter(
+                min_speech_ms=settings.asr_min_speech_ms,
+                silence_end_ms=settings.asr_silence_end_ms,
+                max_utterance_ms=settings.asr_max_utterance_ms,
+                rms_threshold=settings.asr_vad_rms_threshold,
             )
-            for segment in segments:
+        return segmenters[source]
+
+    async def transcribe_final_audio(final_audio: FinalizedAudio) -> None:
+        if not session:
+            return
+        source = normalize_audio_source(final_audio.source)
+        speaker = speaker_for_source(source)
+        asr_started = time.perf_counter()
+        log_audio_debug(
+            "asr.started",
+            {
+                "source": source,
+                "duration_ms": int(final_audio.duration_seconds * 1000),
+                "bytes": len(final_audio.data),
+                "queue_size": audio_queue.qsize(),
+                "inflight_asr": len(asr_tasks),
+            },
+        )
+        await send_event(
+            MeetingEvent(
+                type="asr.started",
+                meeting_id=session.engine.state.meeting_id,
+                payload={
+                    "source": source,
+                    "duration_ms": int(final_audio.duration_seconds * 1000),
+                    "queue_size": audio_queue.qsize(),
+                    "inflight_asr": len(asr_tasks),
+                },
+            )
+        )
+        try:
+            result = await make_asr_provider().transcribe_audio_chunk(
+                final_audio.data,
+                sample_rate=final_audio.sample_rate,
+                language=settings.whisper_language,
+                audio_format="pcm_s16le",
+            )
+            asr_wall_latency_ms = int((time.perf_counter() - asr_started) * 1000)
+            asr_latency_ms = result.processing_time_ms
+            asr_queue_latency_ms = max(0, asr_wall_latency_ms - asr_latency_ms)
+            text = " ".join(segment.text for segment in result.segments).strip()
+            metrics = {
+                "source": source,
+                "audio_duration_ms": int(final_audio.duration_seconds * 1000),
+                "audio_finalize_latency_ms": int((asr_started - final_audio.finalized_at) * 1000),
+                "asr_latency_ms": asr_latency_ms,
+                "asr_wall_latency_ms": asr_wall_latency_ms,
+                "asr_queue_latency_ms": asr_queue_latency_ms,
+                "real_time_factor": result.real_time_factor,
+                "segment_count": len(result.segments),
+                "text_chars": len(text),
+                "model": result.model,
+                "device": result.device,
+                "compute_type": result.compute_type,
+            }
+            session.engine.event_logger.log_asr_metrics(session.engine.state.meeting_id, metrics)
+            log_audio_debug("asr.completed", metrics)
+            await send_event(
+                MeetingEvent(
+                    type="asr.completed",
+                    meeting_id=session.engine.state.meeting_id,
+                    payload=metrics,
+                )
+            )
+            if not text:
                 await send_event(
                     MeetingEvent(
-                        type="transcript.partial",
+                        type="transcript.empty",
                         meeting_id=session.engine.state.meeting_id,
-                        payload={"speaker": speaker, "text": segment.text, "source": source},
+                        payload=metrics,
                     )
                 )
-                await session.ingest_final_utterance(speaker=speaker, text=segment.text, source=source)
+                await send_live_state(
+                    {
+                        "last_asr_latency_ms": asr_latency_ms,
+                        "last_asr_queue_latency_ms": asr_queue_latency_ms,
+                        "last_transcript_empty": True,
+                    }
+                )
+                return
+            for index, segment in enumerate(result.segments, start=1):
+                session.engine.event_logger.log_transcript_segment(
+                    session.engine.state.meeting_id,
+                    segment,
+                    {
+                        "id": f"utt_pending_{index}",
+                        "speaker": speaker,
+                        "source": source,
+                        "asr_latency_ms": asr_latency_ms,
+                        "model": result.model,
+                    },
+                )
+            utterance = await session.ingest_final_utterance(
+                speaker=speaker,
+                text=text,
+                source=source,
+                start=final_audio.start_seconds,
+                end=final_audio.end_seconds,
+                language=result.language,
+                asr_latency_ms=asr_latency_ms,
+                audio_finalize_latency_ms=metrics["audio_finalize_latency_ms"],
+            )
+            await send_live_state(
+                {
+                    "utterance_count": utterance.id,
+                    "last_asr_latency_ms": asr_latency_ms,
+                    "last_asr_queue_latency_ms": asr_queue_latency_ms,
+                    "last_transcript_empty": False,
+                }
+            )
         except Exception as exc:
+            log_audio_debug(
+                "asr.error",
+                {
+                    "source": source,
+                    "duration_ms": int(final_audio.duration_seconds * 1000),
+                    "bytes": len(final_audio.data),
+                    "error": str(exc),
+                },
+            )
+            logger.exception("Live ASR failed for source=%s", source)
             await send_event(
                 MeetingEvent(
                     type="transcript.error",
@@ -172,14 +430,70 @@ async def live_ws(websocket: WebSocket):
                 )
             )
 
-    def schedule_transcription(source: str) -> None:
-        data = bytes(audio_buffers.get(source, b""))
-        audio_buffers[source] = bytearray()
-        if not data:
-            return
-        task = asyncio.create_task(transcribe_buffer(source, data))
-        transcription_tasks.add(task)
-        task.add_done_callback(transcription_tasks.discard)
+    def schedule_asr(final_audio: FinalizedAudio) -> None:
+        log_audio_debug(
+            "asr.scheduled",
+            {
+                "source": normalize_audio_source(final_audio.source),
+                "duration_ms": int(final_audio.duration_seconds * 1000),
+                "bytes": len(final_audio.data),
+                "queue_size": audio_queue.qsize(),
+            },
+        )
+        task = asyncio.create_task(transcribe_final_audio(final_audio))
+        asr_tasks.add(task)
+        task.add_done_callback(asr_tasks.discard)
+
+    async def audio_worker() -> None:
+        while True:
+            item = await audio_queue.get()
+            try:
+                if item is None:
+                    for source, segmenter in list(segmenters.items()):
+                        final_audio = segmenter.flush(source)
+                        if final_audio:
+                            schedule_asr(final_audio)
+                    return
+                for event in segmenter_for(item.source).push(item):
+                    if isinstance(event, SpeechStarted):
+                        source = normalize_audio_source(event.source)
+                        log_audio_debug("speech.started", {"source": source, "start": event.start_seconds})
+                        await send_event(
+                            MeetingEvent(
+                                type="speech.started",
+                                meeting_id=current_meeting_id(),
+                                payload={"source": source, "start": event.start_seconds},
+                            )
+                        )
+                    else:
+                        source = normalize_audio_source(event.source)
+                        log_audio_debug(
+                            "speech.ended",
+                            {
+                                "source": source,
+                                "start": event.start_seconds,
+                                "end": event.end_seconds,
+                                "duration_ms": int(event.duration_seconds * 1000),
+                                "bytes": len(event.data),
+                            },
+                        )
+                        await send_event(
+                            MeetingEvent(
+                                type="speech.ended",
+                                meeting_id=current_meeting_id(),
+                                payload={
+                                    "source": source,
+                                    "start": event.start_seconds,
+                                    "end": event.end_seconds,
+                                    "duration_ms": int(event.duration_seconds * 1000),
+                                },
+                            )
+                        )
+                        schedule_asr(event)
+            finally:
+                audio_queue.task_done()
+
+    worker_task = asyncio.create_task(audio_worker())
 
     try:
         while True:
@@ -194,13 +508,43 @@ async def live_ws(websocket: WebSocket):
                 session = LiveMeetingSession(
                     engine,
                     max_llm_concurrency=get_settings().max_llm_concurrency,
+                    llm_enabled=bool(message.get("llm_enabled", True)),
                     on_event=send_event,
+                )
+                logger.info(
+                    "Live meeting started: meeting=%s model=%s llm_enabled=%s vad_threshold=%s silence_end_ms=%s",
+                    engine.state.meeting_id,
+                    model or settings.llm_model or "-",
+                    session.llm_enabled,
+                    settings.asr_vad_rms_threshold,
+                    settings.asr_silence_end_ms,
+                )
+                engine.event_logger.save_audio_metadata(
+                    engine.state.meeting_id,
+                    {
+                        "sample_rate": 16000,
+                        "format": "pcm_s16le",
+                        "sources": ["MIC", "TAB_AUDIO"],
+                        "save_raw_audio": settings.save_raw_audio,
+                    },
                 )
                 await send_event(
                     MeetingEvent(
                         type="meeting.state.updated",
                         meeting_id=engine.state.meeting_id,
-                        payload={"meeting_id": engine.state.meeting_id},
+                        payload={"meeting_id": engine.state.meeting_id, "llm_enabled": session.llm_enabled},
+                    )
+                )
+            elif event_type == "llm.set_enabled":
+                if not session:
+                    raise RuntimeError("meeting.start must be sent first")
+                session.llm_enabled = bool(message.get("enabled", True))
+                log_audio_debug("llm.set_enabled", {"enabled": session.llm_enabled})
+                await send_event(
+                    MeetingEvent(
+                        type="meeting.state.updated",
+                        meeting_id=session.engine.state.meeting_id,
+                        payload={"llm_enabled": session.llm_enabled},
                     )
                 )
             elif event_type == "utterance.final":
@@ -220,32 +564,54 @@ async def live_ws(websocket: WebSocket):
                     )
                 )
             elif event_type == "audio.chunk":
-                source = message.get("source", "REMOTE_AUDIO")
+                source = normalize_audio_source(message.get("source", "TAB_AUDIO"))
                 data = base64.b64decode(message.get("data", ""))
-                audio_buffers.setdefault(source, bytearray()).extend(data)
+                sample_rate = int(message.get("sample_rate", 16000))
+                await audio_queue.put(AudioQueueItem(source=source, data=data, sample_rate=sample_rate))
+                stats = chunk_stats.setdefault(source, {"chunks": 0, "bytes": 0, "last_log_at": 0.0})
+                stats["chunks"] = int(stats["chunks"]) + 1
+                stats["bytes"] = int(stats["bytes"]) + len(data)
+                now = time.perf_counter()
+                if now - float(stats["last_log_at"]) >= 5:
+                    payload = {
+                        "source": source,
+                        "chunks": stats["chunks"],
+                        "bytes": stats["bytes"],
+                        "queue_size": audio_queue.qsize(),
+                        "sample_rate": sample_rate,
+                    }
+                    log_audio_debug("audio.chunks", payload)
+                    stats["chunks"] = 0
+                    stats["bytes"] = 0
+                    stats["last_log_at"] = now
                 await send_event(
                     MeetingEvent(
                         type="audio.chunk",
-                        meeting_id=session.engine.state.meeting_id if session else None,
-                        payload={"source": source, "bytes": len(data)},
+                        meeting_id=current_meeting_id(),
+                        payload={"source": source, "bytes": len(data), "queue_size": audio_queue.qsize()},
                     )
                 )
-                if len(audio_buffers[source]) >= 240_000:
-                    schedule_transcription(source)
             elif event_type == "audio.flush":
-                source = message.get("source", "REMOTE_AUDIO")
-                schedule_transcription(source)
+                source = normalize_audio_source(message.get("source", "TAB_AUDIO"))
+                final_audio = segmenter_for(source).flush(source)
+                if final_audio:
+                    schedule_asr(final_audio)
             elif event_type == "meeting.stop":
-                for source in list(audio_buffers):
-                    schedule_transcription(source)
-                if transcription_tasks:
-                    await asyncio.gather(*transcription_tasks)
+                await audio_queue.put(None)
+                await worker_task
+                if asr_tasks:
+                    await asyncio.gather(*asr_tasks, return_exceptions=True)
                 if session:
                     await session.drain()
                     await send_event(MeetingEvent(type="meeting.ended", meeting_id=session.engine.state.meeting_id))
                 break
     except WebSocketDisconnect:
-        if transcription_tasks:
-            await asyncio.gather(*transcription_tasks)
+        disconnected = True
+        worker_task.cancel()
+        if asr_tasks:
+            await asyncio.gather(*asr_tasks, return_exceptions=True)
         if session:
             await session.drain()
+    finally:
+        if not worker_task.done():
+            worker_task.cancel()

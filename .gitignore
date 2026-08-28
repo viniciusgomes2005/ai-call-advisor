@@ -10,8 +10,8 @@ node_modules/
 frontend/dist/
 
 data/sessions/
+backend/data/sessions/
 benchmarks/results/*.json
 
 .env
 backend/.env
-

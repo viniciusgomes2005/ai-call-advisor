@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from app.schemas import InterventionCategory, LLMDecision, Utterance
+from app.schemas import InterventionCategory, LLMDecision, TranscriptSegment, Utterance
 from app.services.replay import ReplayService
 from app.schemas import ReplayRequest
 
@@ -130,3 +130,42 @@ async def test_session_persistence(tmp_path, delegate, prompt_path):
     assert (session_dir / "decisions.jsonl").exists()
     assert (session_dir / "insights.jsonl").exists()
     assert (session_dir / "metrics.json").exists()
+
+
+async def test_asr_latency_is_carried_into_decision(tmp_path, delegate, prompt_path):
+    llm = StaticLLMProvider()
+    engine = make_test_engine(tmp_path, delegate, llm, prompt_path)
+
+    decision = await engine.ingest_utterance(
+        Utterance(
+            id=1,
+            speaker="REMOTE",
+            text="Atualmente utilizamos SAP ECC.",
+            source="TAB_AUDIO",
+            asr_latency_ms=700,
+            audio_finalize_latency_ms=20,
+        )
+    )
+
+    assert decision.llm_latency_ms == 3
+    assert decision.total_suggestion_latency_ms is not None
+    assert decision.total_suggestion_latency_ms >= 720
+
+
+async def test_session_asr_logging(tmp_path, delegate, prompt_path):
+    llm = StaticLLMProvider()
+    engine = make_test_engine(tmp_path, delegate, llm, prompt_path)
+
+    engine.event_logger.log_transcript_segment(
+        engine.state.meeting_id,
+        TranscriptSegment(start=0, end=1, text="SAP ECC", language="pt"),
+        {"speaker": "REMOTE", "source": "TAB_AUDIO", "asr_latency_ms": 100},
+    )
+    engine.event_logger.log_asr_metrics(
+        engine.state.meeting_id,
+        {"utterance_id": "utt_1", "audio_duration_ms": 1000, "asr_latency_ms": 100},
+    )
+
+    session_dir = tmp_path / "sessions" / engine.state.meeting_id
+    assert (session_dir / "transcript.jsonl").read_text(encoding="utf-8")
+    assert (session_dir / "asr_metrics.jsonl").read_text(encoding="utf-8")

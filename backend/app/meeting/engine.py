@@ -58,6 +58,20 @@ class MeetingEngine:
             llm_latency_ms=result.latency_ms,
         )
 
+    async def record_utterance(self, utterance: Utterance) -> list[MeetingInsight]:
+        async with self._lock:
+            if any(existing.id == utterance.id for existing in self.state.utterances):
+                utterance.id = max((u.id for u in self.state.utterances), default=0) + 1
+            self.state.utterances.append(utterance)
+            insights = detect_meeting_insights(utterance)
+            self.state.insights.extend(insights)
+            self.context_manager.update_recent_context(self.state)
+            self.event_logger.log_utterance(self.state.meeting_id, utterance)
+            for insight in insights:
+                self.event_logger.log_insight(self.state.meeting_id, insight)
+            self.event_logger.save_state(self.state)
+            return insights
+
     async def ingest_utterance(self, utterance: Utterance) -> InterventionDecision:
         pipeline_start = time.perf_counter()
         async with self._lock:
@@ -88,6 +102,11 @@ class MeetingEngine:
             output_tokens=result.output_tokens,
             llm_latency_ms=result.latency_ms,
             pipeline_latency_ms=pipeline_latency_ms,
+            total_suggestion_latency_ms=(
+                (utterance.audio_finalize_latency_ms or 0) + (utterance.asr_latency_ms or 0) + pipeline_latency_ms
+                if utterance.asr_latency_ms is not None or utterance.audio_finalize_latency_ms is not None
+                else None
+            ),
             stale=pipeline_latency_ms / 1000 > self.max_suggestion_age_seconds,
         )
         async with self._lock:

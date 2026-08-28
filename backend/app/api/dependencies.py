@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 
 from app.asr import FasterWhisperProvider
@@ -21,9 +22,23 @@ def make_llm_provider() -> LMStudioProvider:
     return LMStudioProvider(settings.llm_base_url, settings.llm_api_key, settings.llm_model)
 
 
+@lru_cache
 def make_asr_provider() -> FasterWhisperProvider:
     settings = get_settings()
-    return FasterWhisperProvider(settings.whisper_model, settings.whisper_device, settings.whisper_compute_type)
+    return FasterWhisperProvider(
+        model_name=settings.whisper_model,
+        device=settings.whisper_device,
+        compute_type=settings.whisper_compute_type,
+        initial_prompt=settings.whisper_initial_prompt,
+        hotwords=settings.whisper_hotwords,
+        language=settings.whisper_language,
+        beam_size=settings.whisper_beam_size,
+        vad_min_silence_duration_ms=settings.whisper_vad_min_silence_duration_ms,
+        condition_on_previous_text=settings.whisper_condition_on_previous_text,
+        use_domain_prompt=settings.asr_use_domain_prompt,
+        warmup=settings.asr_warmup,
+        parallel_workers=settings.asr_parallel_workers,
+    )
 
 
 def make_engine(delegate: DelegateProfile, meeting_id: str | None = None, model: str | None = None) -> MeetingEngine:
@@ -38,4 +53,3 @@ def make_engine(delegate: DelegateProfile, meeting_id: str | None = None, model:
         model=model or settings.llm_model or None,
         max_suggestion_age_seconds=settings.max_suggestion_age_seconds,
     )
-

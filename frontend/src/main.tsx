@@ -1,9 +1,23 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Brain, MonitorUp, PauseCircle, PictureInPicture2, Play, RotateCcw, Send, Upload } from "lucide-react";
+import {
+  Brain,
+  CheckCircle2,
+  Circle,
+  Loader2,
+  Mic,
+  MonitorUp,
+  PauseCircle,
+  RotateCcw,
+  Send,
+  SlidersHorizontal,
+  Volume2,
+  VolumeX,
+} from "lucide-react";
 import "./styles.css";
 
 type Category = "EXPLICIT_CUE" | "IMPLICIT_CUE" | "CHIME_IN" | "KEEP_SILENCE";
+type AudioSource = "TAB_AUDIO" | "MIC";
 
 type ShareableInfo = { context: string; information: string };
 type Delegate = {
@@ -12,7 +26,17 @@ type Delegate = {
   meeting_intents: string[];
   shareable_information: ShareableInfo[];
 };
-type Utterance = { id: number; speaker: string; text: string; timestamp?: string; source?: string };
+type Utterance = {
+  id: number;
+  speaker: string;
+  text: string;
+  timestamp?: string;
+  source?: string;
+  start?: number;
+  end?: number;
+  language?: string | null;
+  asr_latency_ms?: number | null;
+};
 type Decision = {
   utterance_id: number;
   category: Category;
@@ -22,17 +46,20 @@ type Decision = {
   reason: string;
   llm_latency_ms?: number;
   pipeline_latency_ms?: number;
+  total_suggestion_latency_ms?: number;
   stale?: boolean;
   displayed?: boolean;
   filtered?: boolean;
 };
 type Health = { backend: "ok"; lm_studio: "ok" | "error"; model?: string; asr: string; error?: string };
-type ChatMessage = {
-  id: string;
-  role: "assistant" | "user" | "meeting" | "insight";
-  text: string;
-  timestamp: string;
-  kind?: string;
+type ASRStatus = {
+  status: "idle" | "loading" | "ready" | "error" | "unavailable";
+  provider: string;
+  model: string;
+  device?: string;
+  compute_type?: string;
+  language?: string | null;
+  detail?: string;
 };
 type MeetingInsight = {
   id: string;
@@ -43,272 +70,343 @@ type MeetingInsight = {
   reason: string;
   confidence: number;
 };
-type DocumentPictureInPictureController = {
-  requestWindow: (options?: { width?: number; height?: number; disallowReturnToOpener?: boolean }) => Promise<Window>;
-  window?: Window | null;
+type LiveEvent = {
+  type: string;
+  meeting_id?: string | null;
+  payload: Record<string, any>;
 };
-
-declare global {
-  interface Window {
-    documentPictureInPicture?: DocumentPictureInPictureController;
-  }
-}
 
 const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 const WS = API.replace(/^http/, "ws");
 
 const defaultDelegate: Delegate = {
-  name: "Bob",
-  role: "Backend Engineer",
-  meeting_intents: ["Understand the status of the voice feature"],
-  shareable_information: [
-    {
-      context: "When backend integration is discussed",
-      information: "The authentication integration was completed last week",
-    },
-  ],
-};
-
-const advisorDelegate: Delegate = {
   name: "Advisor",
   role: "Senior product and engineering advisor for the AI Call Advisor project",
   meeting_intents: [
-    "Help evaluate whether the product should prioritize floating widget, browser extension, or web dashboard workflows",
-    "Identify product risks around privacy, meeting consent, latency, transcription errors, and user trust",
+    "Help evaluate product and engineering tradeoffs during live calls",
+    "Identify risks around privacy, consent, latency, transcription errors, and user trust",
     "Suggest pragmatic next implementation steps for a meeting delegate MVP",
-    "Challenge decisions that make the assistant too autonomous before user approval and auditability exist",
   ],
   shareable_information: [
     {
-      context: "When the team discusses the frontend, floating widget, browser extension, or meeting UI",
-      information:
-        "The current product has a web dashboard and a Document Picture-in-Picture floating widget. The widget is a good MVP for always-on-top assistance, while a browser extension is likely better later for lower-friction capture inside Meet or Teams.",
-    },
-    {
       context: "When the team discusses live meetings, Teams, Google Meet, audio capture, or transcription",
       information:
-        "The current implementation captures the meeting tab audio and local microphone, sends audio chunks to the backend, transcribes with faster-whisper, and processes utterance.final events through MeetingEngine.",
+        "The implementation captures tab audio and local microphone, sends audio chunks to the backend, transcribes with faster-whisper, and can optionally process utterances through LM Studio.",
     },
     {
       context: "When the team discusses LLM integration or local models",
-      information:
-        "The backend talks to LM Studio through OpenAI-compatible endpoints. The important endpoints are GET /v1/models and POST /v1/chat/completions.",
-    },
-    {
-      context: "When the team discusses what the assistant should say during meetings",
-      information:
-        "The assistant should be cautious. It should respond when explicitly cued, when the delegate role is clearly relevant, or when a short contribution materially advances the meeting. Otherwise it should keep silence.",
-    },
-    {
-      context: "When privacy, compliance, or real-world deployment is discussed",
-      information:
-        "The safest product phase is Assist, not full Delegate. The assistant should suggest responses, keep an audit trail, and require user approval before speaking on behalf of the user.",
-    },
-    {
-      context: "When the team discusses next steps",
-      information:
-        "The next high-leverage steps are: add attendees to the meeting profile, improve noisy-name cue detection, add approval actions to the widget, and build a simple manual test script for repeated product demos.",
+      information: "The backend talks to LM Studio through OpenAI-compatible endpoints.",
     },
   ],
 };
 
-const defaultReplay = JSON.stringify(
-  {
-    delegate: defaultDelegate,
-    utterances: [
-      { id: 1, speaker: "Alice", text: "The voice UI is ready for integration testing." },
-      { id: 2, speaker: "Carol", text: "There are still latency spikes when people talk over each other." },
-      { id: 3, speaker: "Alice", text: "Bob, what does backend think about this?" },
-    ],
-  },
-  null,
-  2,
-);
-
-const advisorReplay = JSON.stringify(
-  {
-    delegate: advisorDelegate,
-    utterances: [
-      {
-        id: 1,
-        speaker: "Vini",
-        text: "Estamos decidindo se o assistente deve ser só dashboard, floating widget ou extensão do Chrome.",
-      },
-      {
-        id: 2,
-        speaker: "Carol",
-        text: "Minha preocupação é que extensão parece mais produto real, mas talvez aumente muito a complexidade agora.",
-      },
-      {
-        id: 3,
-        speaker: "Vini",
-        text: "Advisor, o que você acha que deveríamos priorizar para o MVP?",
-      },
-    ],
-  },
-  null,
-  2,
-);
+const emptyLevels: Record<AudioSource, number> = { TAB_AUDIO: 0, MIC: 0 };
+const emptySpeech: Record<AudioSource, boolean> = { TAB_AUDIO: false, MIC: false };
+const emptyTrackStatus: Record<AudioSource, string> = { TAB_AUDIO: "idle", MIC: "idle" };
 
 function App() {
   const [health, setHealth] = useState<Health | null>(null);
+  const [asrStatus, setAsrStatus] = useState<ASRStatus | null>(null);
   const [models, setModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState("");
   const [delegate, setDelegate] = useState<Delegate>(defaultDelegate);
   const [meetingId, setMeetingId] = useState("");
-  const [mode, setMode] = useState<"REPLAY" | "LIVE">("REPLAY");
   const [utterances, setUtterances] = useState<Utterance[]>([]);
   const [decisions, setDecisions] = useState<Decision[]>([]);
-  const [showSilence, setShowSilence] = useState(true);
-  const [replayJson, setReplayJson] = useState(defaultReplay);
-  const [manualSpeaker, setManualSpeaker] = useState("ME");
-  const [manualText, setManualText] = useState("");
+  const [insights, setInsights] = useState<MeetingInsight[]>([]);
   const [debug, setDebug] = useState<Record<string, string | number>>({});
   const [liveActive, setLiveActive] = useState(false);
-  const [floatingSupported] = useState(() => Boolean(window.documentPictureInPicture));
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
-    {
-      id: crypto.randomUUID(),
-      role: "assistant",
-      text: "Abra uma reunião live ou rode um replay para eu acompanhar o contexto. Você pode perguntar sobre o que já foi dito.",
-      timestamp: new Date().toISOString(),
-    },
-  ]);
+  const [llmEnabled, setLlmEnabled] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [captureStage, setCaptureStage] = useState<"idle" | "screen" | "microphone" | "connecting" | "live" | "error">(
+    "idle",
+  );
+  const [captureError, setCaptureError] = useState("");
+  const [asrProcessing, setAsrProcessing] = useState(0);
+  const [lastTranscriptEmpty, setLastTranscriptEmpty] = useState(false);
+  const [previewStream, setPreviewStream] = useState<MediaStream | null>(null);
+  const [audioLevels, setAudioLevels] = useState<Record<AudioSource, number>>(emptyLevels);
+  const [speechActive, setSpeechActive] = useState<Record<AudioSource, boolean>>(emptySpeech);
+  const [trackStatus, setTrackStatus] = useState<Record<AudioSource, string>>(emptyTrackStatus);
+  const [manualSpeaker, setManualSpeaker] = useState("ME");
+  const [manualText, setManualText] = useState("");
+  const [question, setQuestion] = useState("");
   const [askingQuestion, setAskingQuestion] = useState(false);
-  const wsRef = useRef<WebSocket | null>(null);
-  const pipWindowRef = useRef<Window | null>(null);
-  const pipRootRef = useRef<ReturnType<typeof createRoot> | null>(null);
-  const recorders = useRef<MediaRecorder[]>([]);
-  const flushTimers = useRef<number[]>([]);
 
-  const lastIntervention = useMemo(
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const liveStreams = useRef<MediaStream[]>([]);
+  const audioContexts = useRef<AudioContext[]>([]);
+  const audioNodes = useRef<AudioNode[]>([]);
+  const meterUpdateAt = useRef<Record<AudioSource, number>>({ TAB_AUDIO: 0, MIC: 0 });
+
+  const latestDecision = useMemo(
     () => [...decisions].reverse().find((item) => item.should_intervene && item.response),
     [decisions],
   );
+  const latestAsrLatency = useMemo(() => {
+    const latencies = utterances.map((item) => item.asr_latency_ms).filter((value): value is number => typeof value === "number");
+    return latencies.at(-1) ?? null;
+  }, [utterances]);
+  const activeSources = useMemo(
+    () => (Object.keys(speechActive) as AudioSource[]).filter((source) => speechActive[source]),
+    [speechActive],
+  );
 
   async function refreshStatus() {
-    const [healthRes, modelsRes] = await Promise.all([
+    const [healthRes, modelsRes, asrRes] = await Promise.all([
       fetch(`${API}/health`).then((r) => r.json()),
       fetch(`${API}/models`).then((r) => (r.ok ? r.json() : { models: [] })),
+      fetch(`${API}/api/asr/status`).then((r) => r.json()),
     ]);
     setHealth(healthRes);
+    setAsrStatus(asrRes);
     const ids = (modelsRes.models ?? []).map((item: { id: string }) => item.id);
     setModels(ids);
     setSelectedModel((current) => current || healthRes.model || ids[0] || "");
   }
 
+  async function refreshAsrStatus() {
+    const asrRes = await fetch(`${API}/api/asr/status`).then((r) => r.json());
+    setAsrStatus(asrRes);
+  }
+
   useEffect(() => {
     refreshStatus().catch(console.error);
+    const interval = window.setInterval(() => {
+      refreshAsrStatus().catch(console.error);
+    }, 3500);
+    return () => window.clearInterval(interval);
   }, []);
 
-  function reset() {
+  useEffect(() => {
+    if (!videoRef.current) return;
+    videoRef.current.srcObject = previewStream;
+  }, [previewStream]);
+
+  useEffect(() => {
+    return () => stopLive();
+  }, []);
+
+  function resetSession() {
     stopLive();
     setMeetingId("");
     setUtterances([]);
     setDecisions([]);
+    setInsights([]);
     setDebug({});
-    setChatMessages([
-      {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        text: "Contexto limpo. Abra uma reunião live ou rode um replay para começar de novo.",
-        timestamp: new Date().toISOString(),
-      },
-    ]);
+    setAsrProcessing(0);
+    setLastTranscriptEmpty(false);
+    setManualText("");
+    setQuestion("");
+    setCaptureError("");
   }
 
-  function loadAdvisorProfile() {
-    stopLive();
-    setDelegate(advisorDelegate);
-    setReplayJson(advisorReplay);
-    setMeetingId("");
-    setUtterances([]);
-    setDecisions([]);
-    setMode("REPLAY");
-    setDebug({});
-    setChatMessages([
-      {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        text: "Perfil Advisor carregado. Use o replay ou uma chamada live e chame 'Advisor' quando quiser uma opinião.",
-        timestamp: new Date().toISOString(),
-      },
-    ]);
-  }
-
-  function addChatMessage(role: ChatMessage["role"], text: string) {
-    setChatMessages((prev) => [
-      ...prev.slice(-49),
-      {
-        id: crypto.randomUUID(),
-        role,
-        text,
-        timestamp: new Date().toISOString(),
-      },
-    ]);
-  }
-
-  function addUtteranceUpdate(utterance: Utterance) {
-    addChatMessage("meeting", `${utterance.speaker}: ${utterance.text}`);
-  }
-
-  function addInsightUpdate(insight: MeetingInsight) {
-    const label =
-      insight.type === "OPEN_QUESTION"
-        ? "Open question"
-        : insight.type === "ACTION_ITEM"
-          ? "Action item"
-          : "Decision";
-    setChatMessages((prev) => [
-      ...prev.slice(-49),
-      {
-        id: insight.id,
-        role: "insight",
-        kind: insight.type,
-        text: `${label}: ${insight.text}`,
-        timestamp: new Date().toISOString(),
-      },
-    ]);
-  }
-
-  function appendDecision(decision: Decision) {
-    setDecisions((prev) => [...prev, decision]);
-    setDebug((prev) => ({
-      ...prev,
-      "LLM latency": decision.llm_latency_ms ?? "-",
-      "Pipeline latency": decision.pipeline_latency_ms ?? "-",
-      "Last intervention": decision.response ?? "KEEP_SILENCE",
-      "LLM queue size": 0,
-    }));
-    if (decision.response) {
-      addChatMessage("assistant", decision.response);
+  function updateLlmEnabled(enabled: boolean) {
+    setLlmEnabled(enabled);
+    const socket = wsRef.current;
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "llm.set_enabled", enabled }));
     }
   }
 
-  async function startReplay() {
-    setMode("REPLAY");
+  async function startLive() {
+    if (wsRef.current?.readyState === WebSocket.OPEN || captureStage === "screen" || captureStage === "microphone") return;
+    setCaptureError("");
     setUtterances([]);
     setDecisions([]);
-    setChatMessages([]);
-    const payload = JSON.parse(replayJson);
-    const res = await fetch(`${API}/replay?model=${encodeURIComponent(selectedModel)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+    setInsights([]);
+    setDebug({});
+    setAsrProcessing(0);
+    setLastTranscriptEmpty(false);
+
+    let display: MediaStream | null = null;
+    let mic: MediaStream | null = null;
+    try {
+      setCaptureStage("screen");
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      display = displayStream;
+      setPreviewStream(displayStream);
+
+      setCaptureStage("microphone");
+      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mic = micStream;
+
+      setCaptureStage("connecting");
+      const socket = await openLiveSocket();
+      wsRef.current = socket;
+      liveStreams.current.push(displayStream, micStream);
+      displayStream.getVideoTracks()[0]?.addEventListener("ended", () => stopLive(), { once: true });
+
+      socket.send(
+        JSON.stringify({
+          type: "meeting.start",
+          delegate,
+          model: selectedModel || undefined,
+          llm_enabled: llmEnabled,
+        }),
+      );
+
+      startPcmSender(socket, new MediaStream(displayStream.getAudioTracks()), "TAB_AUDIO");
+      startPcmSender(socket, new MediaStream(micStream.getAudioTracks()), "MIC");
+      setTrackStatus((prev) => ({
+        ...prev,
+        TAB_AUDIO: displayStream.getAudioTracks().length ? "capturing" : "no track",
+        MIC: micStream.getAudioTracks().length ? "capturing" : "no track",
+      }));
+      setLiveActive(true);
+      setCaptureStage("live");
+    } catch (error) {
+      display?.getTracks().forEach((track) => track.stop());
+      mic?.getTracks().forEach((track) => track.stop());
+      setCaptureStage("error");
+      setCaptureError(error instanceof Error ? error.message : String(error));
+      stopLive();
+    }
+  }
+
+  function openLiveSocket(): Promise<WebSocket> {
+    const socket = new WebSocket(`${WS}/ws/live`);
+    socket.onmessage = (message) => handleLiveEvent(JSON.parse(message.data));
+    socket.onclose = () => {
+      wsRef.current = null;
+      setLiveActive(false);
+      setCaptureStage((current) => (current === "live" ? "idle" : current));
+    };
+    return new Promise((resolve, reject) => {
+      socket.onopen = () => resolve(socket);
+      socket.onerror = () => reject(new Error("Nao foi possivel conectar ao backend live."));
     });
-    const data = await res.json();
-    setMeetingId(data.meeting_id);
-    setUtterances(payload.utterances);
-    setDecisions(data.decisions);
-    for (const utterance of payload.utterances as Utterance[]) {
-      addUtteranceUpdate(utterance);
+  }
+
+  function handleLiveEvent(event: LiveEvent) {
+    if (event.type === "meeting.state.updated") {
+      if (event.payload.meeting_id) setMeetingId(String(event.payload.meeting_id));
+      if (typeof event.payload.llm_enabled === "boolean") setLlmEnabled(event.payload.llm_enabled);
+      if (event.payload.last_asr_latency_ms) {
+        setDebug((prev) => ({ ...prev, ASR: `${event.payload.last_asr_latency_ms} ms` }));
+      }
+      if (typeof event.payload.last_asr_queue_latency_ms === "number") {
+        setDebug((prev) => ({ ...prev, "ASR espera": `${event.payload.last_asr_queue_latency_ms} ms` }));
+      }
+      if (typeof event.payload.last_transcript_empty === "boolean") {
+        setLastTranscriptEmpty(event.payload.last_transcript_empty);
+      }
     }
-    for (const decision of data.decisions as Decision[]) {
-      if (decision.response) addChatMessage("assistant", decision.response);
+    if (event.type === "asr.started") {
+      setAsrProcessing((count) => count + 1);
+      setDebug((prev) => ({
+        ...prev,
+        "ASR fila": String(event.payload.queue_size ?? 0),
+        "ASR trecho": `${event.payload.source ?? "-"} ${event.payload.duration_ms ?? "-"} ms`,
+      }));
     }
-    for (const insight of data.insights ?? []) {
-      addInsightUpdate(insight);
+    if (event.type === "asr.completed") {
+      setAsrProcessing((count) => Math.max(0, count - 1));
+      setDebug((prev) => ({
+        ...prev,
+        "ASR RTF": typeof event.payload.real_time_factor === "number" ? event.payload.real_time_factor.toFixed(2) : "-",
+        "ASR segmentos": String(event.payload.segment_count ?? 0),
+        "ASR espera": `${event.payload.asr_queue_latency_ms ?? 0} ms`,
+      }));
     }
+    if (event.type === "transcript.empty") {
+      setLastTranscriptEmpty(true);
+    }
+    if (event.type === "utterance.final") {
+      setUtterances((prev) => [...prev, event.payload as Utterance]);
+    }
+    if (event.type === "intervention.decided") {
+      setDecisions((prev) => [...prev, event.payload as Decision]);
+    }
+    if (event.type === "intervention.error") {
+      setDebug((prev) => ({ ...prev, LLM: String(event.payload.error ?? "erro") }));
+    }
+    if (event.type === "meeting.insight.detected") {
+      setInsights((prev) => [...prev, event.payload as MeetingInsight]);
+    }
+    if (event.type === "audio.chunk") {
+      const source = event.payload.source as AudioSource;
+      setDebug((prev) => ({ ...prev, [`${source} chunk`]: `${event.payload.bytes} bytes` }));
+    }
+    if (event.type === "speech.started" || event.type === "speech.ended") {
+      const source = event.payload.source as AudioSource;
+      setSpeechActive((prev) => ({ ...prev, [source]: event.type === "speech.started" }));
+    }
+    if (event.type === "transcript.error") {
+      setAsrProcessing((count) => Math.max(0, count - 1));
+      setCaptureError(String(event.payload.error ?? "Erro de transcricao"));
+    }
+  }
+
+  function startPcmSender(socket: WebSocket, stream: MediaStream, source: AudioSource) {
+    if (stream.getAudioTracks().length === 0) {
+      setTrackStatus((prev) => ({ ...prev, [source]: "no track" }));
+      return;
+    }
+
+    const context = new AudioContext();
+    const input = context.createMediaStreamSource(stream);
+    const processor = context.createScriptProcessor(4096, 1, 1);
+    const muted = context.createGain();
+    muted.gain.value = 0;
+
+    input.connect(processor);
+    processor.connect(muted);
+    muted.connect(context.destination);
+
+    processor.onaudioprocess = (event) => {
+      const samples = event.inputBuffer.getChannelData(0);
+      updateAudioMeter(source, samples);
+      if (socket.readyState !== WebSocket.OPEN) return;
+      const pcm = downsampleToPcm16(samples, context.sampleRate, 16000);
+      if (!pcm.byteLength) return;
+      socket.send(JSON.stringify({ type: "audio.chunk", source, sample_rate: 16000, data: arrayBufferToBase64(pcm.buffer) }));
+    };
+
+    audioContexts.current.push(context);
+    audioNodes.current.push(input, processor, muted);
+    void context.resume();
+  }
+
+  function updateAudioMeter(source: AudioSource, samples: Float32Array) {
+    let sum = 0;
+    for (let index = 0; index < samples.length; index += 1) sum += samples[index] * samples[index];
+    const rms = Math.sqrt(sum / samples.length);
+    const level = Math.min(1, rms * 12);
+    const now = performance.now();
+    if (now - meterUpdateAt.current[source] < 80) return;
+    meterUpdateAt.current[source] = now;
+    setAudioLevels((prev) => ({ ...prev, [source]: level }));
+  }
+
+  function stopLive() {
+    for (const node of audioNodes.current) {
+      try {
+        node.disconnect();
+      } catch {
+        // Already disconnected by the browser.
+      }
+    }
+    for (const context of audioContexts.current) void context.close();
+    for (const stream of liveStreams.current) {
+      for (const track of stream.getTracks()) track.stop();
+    }
+    liveStreams.current = [];
+    audioContexts.current = [];
+    audioNodes.current = [];
+    setPreviewStream(null);
+    setAudioLevels(emptyLevels);
+    setSpeechActive(emptySpeech);
+    setTrackStatus(emptyTrackStatus);
+    setAsrProcessing(0);
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "meeting.stop" }));
+      wsRef.current.close();
+    }
+    wsRef.current = null;
+    setLiveActive(false);
+    setCaptureStage("idle");
   }
 
   async function createMeetingIfNeeded(): Promise<string> {
@@ -324,8 +422,8 @@ function App() {
   }
 
   async function sendManual() {
-    const id = await createMeetingIfNeeded();
     if (!manualText.trim()) return;
+    const id = await createMeetingIfNeeded();
     const res = await fetch(`${API}/meetings/${id}/utterances`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -333,136 +431,15 @@ function App() {
     });
     const data = await res.json();
     setUtterances((prev) => [...prev, data.utterance]);
-    addUtteranceUpdate(data.utterance);
-    for (const insight of data.insights ?? []) {
-      addInsightUpdate(insight);
-    }
-    appendDecision(data.decision);
+    setInsights((prev) => [...prev, ...(data.insights ?? [])]);
+    setDecisions((prev) => [...prev, data.decision]);
     setManualText("");
   }
 
-  async function uploadAudio(file: File) {
-    const id = await createMeetingIfNeeded();
-    const form = new FormData();
-    form.append("file", file);
-    const res = await fetch(`${API}/meetings/${id}/audio?speaker=UNKNOWN`, { method: "POST", body: form });
-    const data = await res.json();
-    for (const item of data.segments ?? []) {
-      setUtterances((prev) => [...prev, item.utterance]);
-      addUtteranceUpdate(item.utterance);
-      for (const insight of item.insights ?? []) {
-        addInsightUpdate(insight);
-      }
-      appendDecision(item.decision);
-    }
-  }
-
-  async function startLive() {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
-    setMode("LIVE");
-    setUtterances([]);
-    setDecisions([]);
-    setChatMessages([
-      {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        text: "Live iniciada. Vou destacar pontos relevantes e responder perguntas usando o contexto capturado.",
-        timestamp: new Date().toISOString(),
-      },
-    ]);
-    const socket = new WebSocket(`${WS}/ws/live`);
-    wsRef.current = socket;
-    socket.onclose = () => {
-      wsRef.current = null;
-      setLiveActive(false);
-    };
-    socket.onopen = () => {
-      setLiveActive(true);
-      socket.send(JSON.stringify({ type: "meeting.start", delegate, model: selectedModel || undefined }));
-    };
-    socket.onmessage = (message) => {
-      const event = JSON.parse(message.data);
-      if (event.type === "meeting.state.updated" && event.payload.meeting_id) {
-        setMeetingId(event.payload.meeting_id);
-      }
-      if (event.type === "utterance.final") {
-        setUtterances((prev) => [...prev, event.payload]);
-        addUtteranceUpdate(event.payload);
-      }
-      if (event.type === "intervention.decided") {
-        appendDecision(event.payload);
-      }
-      if (event.type === "meeting.insight.detected") {
-        addInsightUpdate(event.payload);
-      }
-      if (event.type === "audio.chunk") {
-        setDebug((prev) => ({ ...prev, "Last audio chunk": `${event.payload.source} ${event.payload.bytes} bytes` }));
-      }
-      if (event.type === "transcript.error") {
-        setDebug((prev) => ({ ...prev, "ASR error": event.payload.error }));
-      }
-    };
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    await captureAudio(socket);
-  }
-
-  async function captureAudio(socket: WebSocket) {
-    alert(
-      "Selecione especificamente a aba do Google Meet ou Teams no Chrome e habilite o compartilhamento de áudio da aba. Em seguida autorize o microfone local.",
-    );
-    const display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-    const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const remoteAudio = new MediaStream(display.getAudioTracks());
-    const micAudio = new MediaStream(mic.getAudioTracks());
-    startRecorder(socket, remoteAudio, "REMOTE_AUDIO");
-    startRecorder(socket, micAudio, "LOCAL_MIC_AUDIO");
-    setDebug((prev) => ({ ...prev, "Audio buffer": "capturing", "Current model": selectedModel || "-" }));
-  }
-
-  function startRecorder(socket: WebSocket, stream: MediaStream, source: "REMOTE_AUDIO" | "LOCAL_MIC_AUDIO") {
-    if (stream.getAudioTracks().length === 0) {
-      setDebug((prev) => ({ ...prev, [`${source} status`]: "no track" }));
-      return;
-    }
-    const recorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
-    recorder.ondataavailable = async (event) => {
-      if (!event.data.size || socket.readyState !== WebSocket.OPEN) return;
-      const data = await blobToBase64(event.data);
-      socket.send(JSON.stringify({ type: "audio.chunk", source, data }));
-    };
-    recorder.start(1000);
-    recorders.current.push(recorder);
-    const timer = window.setInterval(() => {
-      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "audio.flush", source }));
-    }, 8000);
-    flushTimers.current.push(timer);
-  }
-
-  function stopLive() {
-    for (const recorder of recorders.current) {
-      if (recorder.state !== "inactive") recorder.stop();
-      for (const track of recorder.stream.getTracks()) track.stop();
-    }
-    for (const timer of flushTimers.current) window.clearInterval(timer);
-    recorders.current = [];
-    flushTimers.current = [];
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: "meeting.stop" }));
-      wsRef.current.close();
-    }
-    wsRef.current = null;
-    setLiveActive(false);
-    setDebug((prev) => ({ ...prev, "Audio buffer": "stopped" }));
-  }
-
-  async function askMeetingQuestion(question: string) {
+  async function askMeetingQuestion(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
     const cleanQuestion = question.trim();
-    if (!cleanQuestion) return;
-    addChatMessage("user", cleanQuestion);
-    if (!meetingId) {
-      addChatMessage("assistant", "Ainda não existe uma reunião ativa. Inicie live, replay ou envie uma utterance manual primeiro.");
-      return;
-    }
+    if (!cleanQuestion || !meetingId || askingQuestion || !llmEnabled) return;
     setAskingQuestion(true);
     try {
       const res = await fetch(`${API}/meetings/${meetingId}/questions?model=${encodeURIComponent(selectedModel)}`, {
@@ -470,637 +447,373 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question: cleanQuestion }),
       });
-      if (!res.ok) {
-        throw new Error(await res.text());
-      }
+      if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
-      addChatMessage("assistant", data.answer);
-      setDebug((prev) => ({ ...prev, "Last question latency": data.llm_latency_ms ?? "-" }));
-    } catch (error) {
-      addChatMessage("assistant", `Não consegui responder agora: ${error instanceof Error ? error.message : String(error)}`);
+      setDecisions((prev) => [
+        ...prev,
+        {
+          utterance_id: utterances.at(-1)?.id ?? 0,
+          category: "CHIME_IN",
+          should_intervene: true,
+          confidence: 1,
+          response: data.answer,
+          reason: cleanQuestion,
+          llm_latency_ms: data.llm_latency_ms,
+        },
+      ]);
+      setQuestion("");
     } finally {
       setAskingQuestion(false);
     }
   }
 
-  async function openFloatingWidget() {
-    const controller = window.documentPictureInPicture;
-    if (!controller) {
-      alert("Floating widget requires a Chromium browser with Document Picture-in-Picture support.");
-      return;
-    }
-    if (!pipWindowRef.current || pipWindowRef.current.closed) {
-      const pipWindow = await controller.requestWindow({ width: 360, height: 500 });
-      pipWindowRef.current = pipWindow;
-      pipWindow.document.title = "Meeting Delegate";
-      pipWindow.document.body.innerHTML = '<div id="floating-root"></div>';
-      const style = pipWindow.document.createElement("style");
-      style.textContent = floatingWidgetCss;
-      pipWindow.document.head.append(style);
-      pipWindow.addEventListener("pagehide", () => {
-        pipRootRef.current?.unmount();
-        pipRootRef.current = null;
-        pipWindowRef.current = null;
-      });
-      pipRootRef.current = createRoot(pipWindow.document.getElementById("floating-root")!);
-    }
-    renderFloatingWidget();
-  }
-
-  function renderFloatingWidget() {
-    if (!pipWindowRef.current || pipWindowRef.current.closed || !pipRootRef.current) return;
-    pipRootRef.current.render(
-      <FloatingWidget
-        health={health}
-        selectedModel={selectedModel}
-        utteranceCount={utterances.length}
-        liveActive={liveActive}
-        latestUtterances={utterances.slice(-3)}
-        chatMessages={chatMessages}
-        askingQuestion={askingQuestion}
-        onStartLive={startLive}
-        onStopLive={stopLive}
-        onAskQuestion={askMeetingQuestion}
-      />,
-    );
-  }
-
-  useEffect(() => {
-    renderFloatingWidget();
-  });
-
-  useEffect(() => {
-    return () => {
-      pipRootRef.current?.unmount();
-      pipWindowRef.current?.close();
-    };
-  }, []);
+  const screenStatus =
+    captureStage === "live"
+      ? "Transmitindo"
+      : captureStage === "screen"
+        ? "Escolhendo tela"
+        : captureStage === "microphone"
+          ? "Autorizando mic"
+          : captureStage === "connecting"
+            ? "Conectando"
+            : "Pronto";
+  const asrLabel =
+    asrProcessing > 0
+      ? `processando ${asrProcessing}`
+      : asrStatus?.status === "idle"
+        ? "idle"
+        : asrStatus?.status === "loading"
+          ? "carregando"
+          : asrStatus?.status ?? "unknown";
 
   return (
-    <main>
-      <section className="panel config">
-        <div className="titleRow">
-          <h1>Meeting Delegate POC</h1>
-          <button className="iconButton" onClick={refreshStatus} title="Refresh status">
+    <main className={llmEnabled ? "appShell" : "appShell llmMuted"}>
+      <aside className="controlRail">
+        <div className="brandBlock">
+          <div>
+            <span className="eyebrow">AI Call Advisor</span>
+            <h1>Live transcription</h1>
+          </div>
+          <button className="iconButton" onClick={refreshStatus} title="Atualizar status">
             <RotateCcw size={18} />
           </button>
         </div>
 
-        <div className="statusGrid">
-          <Status label="LM Studio" value={health?.lm_studio ?? "unknown"} ok={health?.lm_studio === "ok"} />
-          <Status label="ASR" value={health?.asr ?? "unknown"} ok={health?.asr === "ok"} />
+        <div className="primaryControls">
+          <button className="startButton" onClick={startLive} disabled={liveActive || captureStage === "screen" || captureStage === "microphone"}>
+            {captureStage === "screen" || captureStage === "microphone" || captureStage === "connecting" ? (
+              <Loader2 size={18} className="spin" />
+            ) : (
+              <MonitorUp size={18} />
+            )}
+            Iniciar captura
+          </button>
+          <button className="stopButton" onClick={stopLive} disabled={!liveActive && captureStage === "idle"}>
+            <PauseCircle size={18} />
+            Parar
+          </button>
         </div>
 
-        <label>
-          Model
-          <select value={selectedModel} onChange={(e) => setSelectedModel(e.target.value)}>
-            <option value="">Select loaded model</option>
+        <section className="controlGroup">
+          <div className="switchRow">
+            <div>
+              <strong>LM Studio</strong>
+              <span>{health?.lm_studio === "ok" ? selectedModel || "online" : "offline"}</span>
+            </div>
+            <button
+              className={llmEnabled ? "switch isOn" : "switch"}
+              onClick={() => updateLlmEnabled(!llmEnabled)}
+              role="switch"
+              aria-checked={llmEnabled}
+              title="Ligar ou desligar chamadas ao LLM"
+            >
+              <span />
+            </button>
+          </div>
+          <select value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)} disabled={!llmEnabled}>
+            <option value="">Modelo local</option>
             {models.map((model) => (
               <option key={model}>{model}</option>
             ))}
           </select>
-        </label>
+        </section>
 
-        <div className="modeSwitch">
-          <button className={mode === "REPLAY" ? "selected" : ""} onClick={() => setMode("REPLAY")}>
-            REPLAY
+        <section className="statusStack">
+          <StatusLine label="Backend" ok={health?.backend === "ok"} value={health?.backend ?? "unknown"} />
+          <StatusLine
+            label="Whisper"
+            ok={Boolean(asrStatus && !["error", "unavailable"].includes(asrStatus.status))}
+            value={asrStatus?.status ?? "unknown"}
+          />
+          <StatusLine label="Modelo ASR" ok={Boolean(asrStatus?.model)} value={asrStatus?.model ?? "-"} />
+          <StatusLine label="Sessao" ok={Boolean(meetingId)} value={meetingId ? meetingId.slice(0, 8) : "-"} />
+        </section>
+
+        <section className="controlGroup">
+          <button className="secondaryButton" onClick={() => setSettingsOpen((open) => !open)}>
+            <SlidersHorizontal size={17} />
+            Perfil do advisor
           </button>
-          <button className={mode === "LIVE" ? "selected" : ""} onClick={() => setMode("LIVE")}>
-            LIVE
-          </button>
+          {settingsOpen && (
+            <div className="settingsPanel">
+              <label>
+                Nome
+                <input value={delegate.name} onChange={(event) => setDelegate({ ...delegate, name: event.target.value })} />
+              </label>
+              <label>
+                Papel
+                <input value={delegate.role} onChange={(event) => setDelegate({ ...delegate, role: event.target.value })} />
+              </label>
+              <label>
+                Intencoes
+                <textarea
+                  value={delegate.meeting_intents.join("\n")}
+                  onChange={(event) =>
+                    setDelegate({ ...delegate, meeting_intents: event.target.value.split("\n").filter(Boolean) })
+                  }
+                />
+              </label>
+            </div>
+          )}
+        </section>
+
+        <section className="manualBox">
+          <div className="manualHeader">
+            <span>Manual</span>
+            <Brain size={15} />
+          </div>
+          <div className="manualRow">
+            <input value={manualSpeaker} onChange={(event) => setManualSpeaker(event.target.value)} aria-label="Speaker" />
+            <input
+              value={manualText}
+              onChange={(event) => setManualText(event.target.value)}
+              onKeyDown={(event) => event.key === "Enter" && void sendManual()}
+              placeholder="Utterance"
+            />
+            <button className="iconButton" onClick={sendManual} title="Enviar utterance">
+              <Send size={17} />
+            </button>
+          </div>
+        </section>
+      </aside>
+
+      <section className="stage">
+        <header className="stageHeader">
+          <div>
+            <span className="eyebrow">Screen preview</span>
+            <h2>{screenStatus}</h2>
+          </div>
+          <div className={liveActive ? "livePill on" : "livePill"}>
+            {liveActive ? <CheckCircle2 size={15} /> : <Circle size={15} />}
+            {liveActive ? "LIVE" : "IDLE"}
+          </div>
+        </header>
+
+        <div className="videoFrame">
+          <video ref={videoRef} autoPlay muted playsInline />
+          {!previewStream && (
+            <div className="emptyPreview">
+              <MonitorUp size={42} />
+              <span>Nenhuma tela selecionada</span>
+            </div>
+          )}
         </div>
 
-        <label>
-          Delegate name
-          <input value={delegate.name} onChange={(e) => setDelegate({ ...delegate, name: e.target.value })} />
-        </label>
-        <label>
-          Role
-          <input value={delegate.role} onChange={(e) => setDelegate({ ...delegate, role: e.target.value })} />
-        </label>
-        <label>
-          Meeting intents
-          <textarea
-            value={delegate.meeting_intents.join("\n")}
-            onChange={(e) => setDelegate({ ...delegate, meeting_intents: e.target.value.split("\n").filter(Boolean) })}
+        <div className="meterDock">
+          <AudioMeter
+            source="TAB_AUDIO"
+            label="Tela"
+            level={audioLevels.TAB_AUDIO}
+            speechActive={speechActive.TAB_AUDIO}
+            status={trackStatus.TAB_AUDIO}
           />
-        </label>
-        <label>
-          Shareable information
-          <textarea
-            value={delegate.shareable_information.map((item) => `${item.context} => ${item.information}`).join("\n")}
-            onChange={(e) =>
-              setDelegate({
-                ...delegate,
-                shareable_information: e.target.value
-                  .split("\n")
-                  .filter(Boolean)
-                  .map((line) => {
-                    const [context, information] = line.split("=>");
-                    return { context: context?.trim() ?? "", information: information?.trim() ?? "" };
-                  }),
-              })
-            }
+          <AudioMeter
+            source="MIC"
+            label="Microfone"
+            level={audioLevels.MIC}
+            speechActive={speechActive.MIC}
+            status={trackStatus.MIC}
           />
-        </label>
-
-        <div className="actions">
-          <button onClick={loadAdvisorProfile}>
-            <Brain size={16} /> Load advisor profile
-          </button>
-          <button onClick={startReplay}>
-            <Play size={16} /> Start replay
-          </button>
-          <button onClick={startLive}>
-            <MonitorUp size={16} /> Start live meeting
-          </button>
-          <button
-            onClick={openFloatingWidget}
-            title={floatingSupported ? "Open floating widget" : "Requires Document Picture-in-Picture support"}
-          >
-            <PictureInPicture2 size={16} /> Floating widget
-          </button>
-          <button onClick={stopLive}>
-            <PauseCircle size={16} /> Stop
-          </button>
-          <button onClick={reset}>
-            <RotateCcw size={16} /> Reset
-          </button>
         </div>
+
+        <section className="signalPanel">
+          <Metric label="Utterances" value={String(utterances.length)} />
+          <Metric label="Whisper" value={asrLabel} muted={asrStatus?.status === "idle"} />
+          <Metric label="ASR" value={latestAsrLatency ? `${latestAsrLatency} ms` : "-"} />
+          <Metric label="Ouvindo" value={activeSources.length ? activeSources.map(sourceLabel).join(" + ") : "-"} />
+          <Metric label="LLM" value={llmEnabled ? "on" : "off"} muted={!llmEnabled} />
+          {Object.entries(debug).map(([key, value]) => (
+            <Metric key={key} label={key} value={String(value)} />
+          ))}
+          {lastTranscriptEmpty && <div className="noticeLine">Audio processado, mas o Whisper nao reconheceu texto nesse trecho.</div>}
+          {captureError && <div className="errorLine">{captureError}</div>}
+        </section>
       </section>
 
-      <section className="panel transcript">
-        <h2>Transcription</h2>
-        <div className="manualRow">
-          <input value={manualSpeaker} onChange={(e) => setManualSpeaker(e.target.value)} aria-label="Speaker" />
-          <input
-            value={manualText}
-            onChange={(e) => setManualText(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && sendManual()}
-            placeholder="Send utterance"
-          />
-          <button className="iconButton" onClick={sendManual} title="Send utterance">
-            <Send size={18} />
+      <aside className="transcriptRail">
+        <header className="railHeader">
+          <div>
+            <span className="eyebrow">Transcript</span>
+            <h2>Ao vivo</h2>
+          </div>
+          <button className="iconButton" onClick={resetSession} title="Limpar sessao">
+            <RotateCcw size={18} />
           </button>
-        </div>
+        </header>
 
-        <label className="upload">
-          <Upload size={18} />
-          Upload WAV/MP3/M4A
-          <input type="file" accept="audio/*" onChange={(e) => e.target.files?.[0] && uploadAudio(e.target.files[0])} />
-        </label>
-
-        {mode === "REPLAY" && (
-          <textarea className="replayBox" value={replayJson} onChange={(e) => setReplayJson(e.target.value)} />
-        )}
-
-        <div className="utteranceList">
+        <div className="transcriptList">
+          {utterances.length === 0 && (
+            <div className="emptyTranscript">
+              <Mic size={24} />
+              <span>Aguardando fala detectada</span>
+            </div>
+          )}
           {utterances.map((item) => (
-            <article key={`${item.id}-${item.text}`} className="utterance">
-              <div className="speaker">
-                <span>{item.id.toString().padStart(2, "0")}</span>
+            <article key={`${item.id}-${item.source}-${item.text}`} className="transcriptItem">
+              <div className="utteranceMeta">
                 <strong>{item.speaker}</strong>
-                <small>{item.source ?? ""}</small>
+                <span>{sourceLabel(item.source)}</span>
+                {typeof item.asr_latency_ms === "number" && <small>{item.asr_latency_ms} ms</small>}
               </div>
               <p>{item.text}</p>
             </article>
           ))}
-        </div>
-      </section>
-
-      <section className="panel decisions">
-        <div className="titleRow">
-          <h2>Decisions</h2>
-          <label className="check">
-            <input type="checkbox" checked={showSilence} onChange={(e) => setShowSilence(e.target.checked)} />
-            Show silence
-          </label>
-        </div>
-
-        <div className="debugGrid">
-          <Status label="Utterances" value={utterances.length.toString()} ok />
-          <Status label="Prompt" value="intervention_v1" ok />
-          <Status label="Model" value={selectedModel || "-"} ok={Boolean(selectedModel)} />
-          <Status label="Last intervention" value={lastIntervention?.category ?? "-"} ok={Boolean(lastIntervention)} />
-          {Object.entries(debug).map(([key, value]) => (
-            <Status key={key} label={key} value={String(value)} ok />
+          {activeSources.map((source) => (
+            <article key={`active-${source}`} className="transcriptItem pending">
+              <div className="utteranceMeta">
+                <strong>{sourceLabel(source)}</strong>
+                <span>captando</span>
+              </div>
+              <div className="typingDots">
+                <span />
+                <span />
+                <span />
+              </div>
+            </article>
           ))}
         </div>
 
-        <div className="decisionList">
-          {decisions
-            .filter((item) => showSilence || item.category !== "KEEP_SILENCE")
-            .map((item, index) => (
-              <article
-                key={`${item.utterance_id}-${index}`}
-                className={`decision ${item.category === "KEEP_SILENCE" ? "silence" : "intervention"}`}
-              >
-                <div className="decisionHeader">
-                  <strong>{item.category}</strong>
-                  <span>{item.confidence.toFixed(2)}</span>
-                </div>
-                {item.response && <blockquote>{item.response}</blockquote>}
-                <p>{item.reason}</p>
-                <small>
-                  u{item.utterance_id} · LLM {item.llm_latency_ms ?? "-"}ms · pipeline{" "}
-                  {item.pipeline_latency_ms ?? "-"}ms {item.filtered ? "· filtered" : ""}
-                </small>
+        {llmEnabled && (
+          <section className="advisorPanel">
+            <div className="advisorHeader">
+              <span>Advisor</span>
+              <strong>{latestDecision?.category ?? "Sem resposta"}</strong>
+            </div>
+            {latestDecision?.response && <blockquote>{latestDecision.response}</blockquote>}
+            {insights.slice(-3).map((insight) => (
+              <article key={insight.id} className="insightItem">
+                <strong>{insight.type.replace("_", " ")}</strong>
+                <p>{insight.text}</p>
               </article>
             ))}
-        </div>
-      </section>
+            <form onSubmit={askMeetingQuestion} className="questionForm">
+              <input
+                value={question}
+                onChange={(event) => setQuestion(event.target.value)}
+                placeholder="Perguntar ao contexto"
+                disabled={!meetingId || askingQuestion}
+              />
+              <button className="iconButton" type="submit" disabled={!meetingId || !question.trim() || askingQuestion}>
+                {askingQuestion ? <Loader2 size={17} className="spin" /> : <Send size={17} />}
+              </button>
+            </form>
+          </section>
+        )}
+      </aside>
     </main>
   );
 }
 
-function Status({ label, value, ok }: { label: string; value: string; ok: boolean }) {
+function StatusLine({ label, value, ok }: { label: string; value: string; ok: boolean }) {
   return (
-    <div className="status">
-      <span className={ok ? "dot ok" : "dot"} />
+    <div className="statusLine">
+      <span className={ok ? "statusDot ok" : "statusDot"} />
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
   );
 }
 
-function FloatingWidget({
-  health,
-  selectedModel,
-  utteranceCount,
-  liveActive,
-  latestUtterances,
-  chatMessages,
-  askingQuestion,
-  onStartLive,
-  onStopLive,
-  onAskQuestion,
+function Metric({ label, value, muted = false }: { label: string; value: string; muted?: boolean }) {
+  return (
+    <div className={muted ? "metric mutedMetric" : "metric"}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function AudioMeter({
+  source,
+  label,
+  level,
+  speechActive,
+  status,
 }: {
-  health: Health | null;
-  selectedModel: string;
-  utteranceCount: number;
-  liveActive: boolean;
-  latestUtterances: Utterance[];
-  chatMessages: ChatMessage[];
-  askingQuestion: boolean;
-  onStartLive: () => void;
-  onStopLive: () => void;
-  onAskQuestion: (question: string) => void;
+  source: AudioSource;
+  label: string;
+  level: number;
+  speechActive: boolean;
+  status: string;
 }) {
-  const [question, setQuestion] = useState("");
-
-  function submitQuestion(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!question.trim() || askingQuestion) return;
-    onAskQuestion(question);
-    setQuestion("");
-  }
-
+  const bars = [0.18, 0.32, 0.5, 0.7, 0.9];
+  const active = speechActive || level > 0.08;
   return (
-    <div className="floatingWidget">
-      <header>
-        <div>
-          <strong>Meeting Delegate</strong>
-          <span>{liveActive ? "Live meeting" : "Standby"}</span>
-        </div>
-        <span className={liveActive ? "pill live" : "pill"}>{liveActive ? "LIVE" : "OFF"}</span>
-      </header>
-
-      <div className="miniStatusGrid">
-        <MiniStatus label="LLM" value={health?.lm_studio ?? "unknown"} ok={health?.lm_studio === "ok"} />
-        <MiniStatus label="ASR" value={health?.asr ?? "unknown"} ok={health?.asr === "ok"} />
-        <MiniStatus label="Model" value={selectedModel || "-"} ok={Boolean(selectedModel)} />
-        <MiniStatus label="Utterances" value={String(utteranceCount)} ok />
+    <div className={active ? "audioMeter active" : "audioMeter"} data-source={source}>
+      <div className="audioIcon">{status === "no track" ? <VolumeX size={18} /> : <Volume2 size={18} />}</div>
+      <div>
+        <strong>{label}</strong>
+        <span>{status === "no track" ? "sem faixa" : active ? "ouvindo" : "silencio"}</span>
       </div>
-
-      <section className="chatFeed" aria-label="Meeting chat">
-        <span>Meeting chat</span>
-        <div className="messages">
-          {chatMessages.map((message) => (
-            <article key={message.id} className={`message ${message.role} ${message.kind ?? ""}`}>
-              <p>{message.text}</p>
-            </article>
-          ))}
-          {askingQuestion && (
-            <article className="message assistant">
-              <p>Thinking...</p>
-            </article>
-          )}
-        </div>
-      </section>
-
-      <section className="miniTranscript">
-        <span>Recent transcript</span>
-        {latestUtterances.length ? (
-          latestUtterances.map((item) => (
-            <article key={`${item.id}-${item.text}`}>
-              <strong>{item.speaker}</strong>
-              <p>{item.text}</p>
-            </article>
-          ))
-        ) : (
-          <p className="muted">No utterances captured.</p>
-        )}
-      </section>
-
-      <footer>
-        <div className="liveControls">
-          <button onClick={onStartLive} disabled={liveActive}>
-            <MonitorUp size={16} /> Start
-          </button>
-          <button onClick={onStopLive} disabled={!liveActive}>
-            <PauseCircle size={16} /> Stop
-          </button>
-        </div>
-        <form onSubmit={submitQuestion}>
-          <input
-            value={question}
-            onChange={(event) => setQuestion(event.target.value)}
-            placeholder="Ask about the meeting"
-            aria-label="Ask about the meeting"
-          />
-          <button type="submit" disabled={askingQuestion || !question.trim()}>
-            <Send size={16} />
-          </button>
-        </form>
-      </footer>
+      <div className="bars" aria-hidden="true">
+        {bars.map((threshold) => (
+          <span key={threshold} style={{ transform: `scaleY(${Math.max(0.12, Math.min(1, level / threshold))})` }} />
+        ))}
+      </div>
     </div>
   );
 }
 
-function MiniStatus({ label, value, ok }: { label: string; value: string; ok: boolean }) {
-  return (
-    <div className="miniStatus">
-      <span className={ok ? "miniDot ok" : "miniDot"} />
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
+function sourceLabel(source?: string | null): string {
+  if (source === "MIC" || source === "LOCAL_MIC" || source === "LOCAL_MIC_AUDIO") return "Mic";
+  if (source === "TAB_AUDIO" || source === "REMOTE_AUDIO" || source === "REMOTE") return "Tela";
+  if (source === "MANUAL") return "Manual";
+  if (source === "FILE") return "Arquivo";
+  return source || "-";
 }
 
-const floatingWidgetCss = `
-  :root {
-    color: #1f2933;
-    background: #f7f9fb;
-    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+function downsampleToPcm16(input: Float32Array, sourceRate: number, targetRate: number): Int16Array {
+  if (sourceRate === targetRate) return floatToPcm16(input);
+  const ratio = sourceRate / targetRate;
+  const outputLength = Math.max(1, Math.floor(input.length / ratio));
+  const output = new Float32Array(outputLength);
+  for (let index = 0; index < outputLength; index += 1) {
+    const start = Math.floor(index * ratio);
+    const end = Math.min(input.length, Math.floor((index + 1) * ratio));
+    let sum = 0;
+    for (let cursor = start; cursor < end; cursor += 1) sum += input[cursor];
+    output[index] = sum / Math.max(1, end - start);
   }
+  return floatToPcm16(output);
+}
 
-  * { box-sizing: border-box; }
-
-  body {
-    margin: 0;
-    min-width: 300px;
-    background: #f7f9fb;
+function floatToPcm16(input: Float32Array): Int16Array {
+  const output = new Int16Array(input.length);
+  for (let index = 0; index < input.length; index += 1) {
+    const sample = Math.max(-1, Math.min(1, input[index]));
+    output[index] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
   }
+  return output;
+}
 
-  button {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 7px;
-    min-height: 36px;
-    border: 1px solid #b8c3d0;
-    border-radius: 6px;
-    background: #ffffff;
-    color: #1f2933;
-    padding: 8px 11px;
-    font: inherit;
-    font-weight: 700;
-    cursor: pointer;
+function arrayBufferToBase64(buffer: ArrayBufferLike): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
   }
-
-  button:disabled {
-    cursor: not-allowed;
-    opacity: 0.55;
-  }
-
-  .floatingWidget {
-    display: grid;
-    gap: 12px;
-    min-height: 100vh;
-    padding: 14px;
-  }
-
-  header,
-  .liveControls,
-  form {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-  }
-
-  footer {
-    display: grid;
-    gap: 8px;
-  }
-
-  header div {
-    display: grid;
-    gap: 2px;
-    min-width: 0;
-  }
-
-  header strong {
-    font-size: 16px;
-  }
-
-  header span,
-  section > span {
-    color: #52616f;
-    font-size: 12px;
-    font-weight: 700;
-  }
-
-  .pill {
-    border: 1px solid #d1d8e2;
-    border-radius: 999px;
-    padding: 5px 8px;
-    background: #ffffff;
-    font-size: 11px;
-    font-weight: 800;
-  }
-
-  .pill.live {
-    border-color: #86efac;
-    background: #dcfce7;
-    color: #166534;
-  }
-
-  .miniStatusGrid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-  }
-
-  .miniStatus {
-    display: grid;
-    grid-template-columns: 8px 1fr;
-    gap: 3px 7px;
-    min-width: 0;
-    border: 1px solid #e0e7ef;
-    border-radius: 8px;
-    background: #ffffff;
-    padding: 8px;
-    font-size: 11px;
-  }
-
-  .miniStatus strong {
-    grid-column: 2;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .miniDot {
-    grid-row: span 2;
-    align-self: center;
-    width: 7px;
-    height: 7px;
-    border-radius: 999px;
-    background: #ef4444;
-  }
-
-  .miniDot.ok {
-    background: #16a34a;
-  }
-
-  input {
-    width: 100%;
-    min-width: 0;
-    border: 1px solid #c9d3df;
-    border-radius: 6px;
-    padding: 9px 10px;
-    color: #1f2933;
-    background: #ffffff;
-    font: inherit;
-  }
-
-  .chatFeed,
-  .miniTranscript {
-    display: grid;
-    gap: 8px;
-    min-width: 0;
-    border: 1px solid #d8dee7;
-    border-radius: 8px;
-    background: #ffffff;
-    padding: 10px;
-  }
-
-  .chatFeed {
-    min-height: 150px;
-    max-height: 240px;
-  }
-
-  .messages {
-    display: grid;
-    align-content: start;
-    gap: 7px;
-    overflow: auto;
-  }
-
-  .message {
-    max-width: 92%;
-    border: 1px solid #e0e7ef;
-    border-radius: 8px;
-    padding: 8px 9px;
-    background: #f8fafc;
-  }
-
-  .message.user {
-    justify-self: end;
-    border-color: #bfdbfe;
-    background: #eff6ff;
-  }
-
-  .message.assistant {
-    justify-self: start;
-    border-color: #c7d2fe;
-    background: #eef2ff;
-  }
-
-  .message.meeting {
-    justify-self: stretch;
-    max-width: 100%;
-    border-color: #e5e7eb;
-    background: #ffffff;
-    color: #4b5563;
-    font-size: 12px;
-  }
-
-  .message.insight {
-    justify-self: stretch;
-    max-width: 100%;
-    border-color: #fed7aa;
-    background: #fff7ed;
-    color: #7c2d12;
-    font-weight: 700;
-  }
-
-  .message.insight.DECISION {
-    border-color: #bbf7d0;
-    background: #f0fdf4;
-    color: #14532d;
-  }
-
-  .message.insight.OPEN_QUESTION {
-    border-color: #fde68a;
-    background: #fffbeb;
-    color: #713f12;
-  }
-
-  p {
-    margin: 0;
-    line-height: 1.42;
-  }
-
-  small,
-  .muted {
-    color: #6b7280;
-  }
-
-  .miniTranscript {
-    align-content: start;
-    overflow: auto;
-  }
-
-  .miniTranscript article {
-    display: grid;
-    gap: 3px;
-    border-top: 1px solid #eef2f7;
-    padding-top: 8px;
-  }
-
-  .miniTranscript article:first-of-type {
-    border-top: 0;
-    padding-top: 0;
-  }
-
-  .miniTranscript article strong {
-    color: #52616f;
-    font-size: 12px;
-  }
-
-  .liveControls button {
-    flex: 1 1 0;
-  }
-
-  form input {
-    flex: 1 1 auto;
-  }
-
-  form button {
-    width: 38px;
-    padding: 0;
-  }
-`;
-
-function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result).split(",")[1] ?? "");
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
+  return btoa(binary);
 }
 
 createRoot(document.getElementById("root")!).render(

@@ -3,7 +3,6 @@ from __future__ import annotations
 from app.core.events import EventBus
 from app.schemas import MeetingEvent
 from app.services.live import LiveMeetingSession
-from app.schemas import Utterance
 
 from .conftest import StaticLLMProvider, make_test_engine
 
@@ -37,3 +36,22 @@ async def test_live_session_does_not_block_new_utterances(tmp_path, delegate, pr
     assert events.count("intervention.decided") == 2
     assert [u.text for u in engine.state.utterances] == ["first", "second"]
 
+
+async def test_live_session_can_record_transcript_without_llm(tmp_path, delegate, prompt_path):
+    events = []
+    llm = StaticLLMProvider()
+
+    async def on_event(event: MeetingEvent) -> None:
+        events.append(event.type)
+
+    engine = make_test_engine(tmp_path, delegate, llm, prompt_path)
+    session = LiveMeetingSession(engine, max_llm_concurrency=1, llm_enabled=False, on_event=on_event)
+
+    await session.ingest_final_utterance("ME", "transcript only", "MIC")
+    await session.drain()
+
+    assert events.count("utterance.final") == 1
+    assert "intervention.requested" not in events
+    assert "intervention.decided" not in events
+    assert [u.text for u in engine.state.utterances] == ["transcript only"]
+    assert llm.prompts == []

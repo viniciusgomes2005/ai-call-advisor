@@ -119,10 +119,12 @@ class LMStudioProvider(LLMProvider):
                         {"role": "system", "content": "Return only valid JSON. Do not include markdown."},
                         {"role": "user", "content": prompt},
                     ],
-                    "response_format": {"type": "json_object"},
                 },
             )
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise RuntimeError(f"LM Studio chat request failed: {response.text}") from exc
             payload = response.json()
             usage = payload.get("usage") or {}
             raw_response = payload["choices"][0]["message"]["content"]
@@ -147,7 +149,6 @@ class LMStudioProvider(LLMProvider):
                             "model": selected_model,
                             "temperature": 0,
                             "messages": [{"role": "user", "content": repair_prompt}],
-                            "response_format": {"type": "json_object"},
                         },
                     )
                     repair.raise_for_status()

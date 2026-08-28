@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from app.schemas import InterventionDecision, MeetingInsight, MeetingState, Utterance
+from app.schemas import InterventionDecision, MeetingInsight, MeetingState, TranscriptSegment, Utterance
 
 
 class EventLogger:
@@ -25,6 +25,31 @@ class EventLogger:
         session_dir = self.base_dir / meeting_id
         session_dir.mkdir(parents=True, exist_ok=True)
         self._append_jsonl(session_dir / "utterances.jsonl", utterance)
+
+    def log_transcript_segment(
+        self, meeting_id: str, segment: TranscriptSegment, extra: dict[str, Any] | None = None
+    ) -> None:
+        session_dir = self.base_dir / meeting_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        payload = segment.model_dump(mode="json")
+        if extra:
+            payload.update(extra)
+        self._append_jsonl_dict(session_dir / "transcript.jsonl", payload)
+
+    def log_asr_metrics(self, meeting_id: str, metrics: dict[str, Any]) -> None:
+        session_dir = self.base_dir / meeting_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        self._append_jsonl_dict(session_dir / "asr_metrics.jsonl", metrics)
+
+    def log_audio_debug(self, meeting_id: str, event: dict[str, Any]) -> None:
+        session_dir = self.base_dir / meeting_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        self._append_jsonl_dict(session_dir / "audio_debug.jsonl", event)
+
+    def save_audio_metadata(self, meeting_id: str, metadata: dict[str, Any]) -> None:
+        session_dir = self.base_dir / meeting_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        self._write_json(session_dir / "audio_metadata.json", metadata)
 
     def log_decision(self, meeting_id: str, decision: InterventionDecision) -> None:
         session_dir = self.base_dir / meeting_id
@@ -74,3 +99,9 @@ class EventLogger:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(value.model_dump(mode="json"), ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _append_jsonl_dict(path: Path, value: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(value, ensure_ascii=False) + "\n")

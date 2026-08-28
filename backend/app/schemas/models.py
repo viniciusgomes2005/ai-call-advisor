@@ -44,7 +44,24 @@ class Utterance(BaseModel):
     speaker: str
     text: str
     timestamp: datetime = Field(default_factory=utc_now)
-    source: Literal["REPLAY", "MANUAL", "REMOTE_AUDIO", "LOCAL_MIC_AUDIO", "FILE_AUDIO", "UNKNOWN"] = "UNKNOWN"
+    source: Literal[
+        "REPLAY",
+        "MANUAL",
+        "FILE",
+        "MIC",
+        "TAB_AUDIO",
+        "REMOTE",
+        "REMOTE_AUDIO",
+        "LOCAL_MIC",
+        "LOCAL_MIC_AUDIO",
+        "FILE_AUDIO",
+        "UNKNOWN",
+    ] = "UNKNOWN"
+    start: float | None = None
+    end: float | None = None
+    language: str | None = None
+    asr_latency_ms: int | None = None
+    audio_finalize_latency_ms: int | None = None
 
     @field_validator("text")
     @classmethod
@@ -82,6 +99,7 @@ class InterventionDecision(LLMDecision):
     output_tokens: int | None = None
     llm_latency_ms: int | None = None
     pipeline_latency_ms: int | None = None
+    total_suggestion_latency_ms: int | None = None
     stale: bool = False
     displayed: bool = False
     filtered: bool = False
@@ -126,7 +144,17 @@ class ReplayRequest(BaseModel):
 class ManualUtteranceRequest(BaseModel):
     speaker: str = "UNKNOWN"
     text: str
-    source: Literal["MANUAL", "REMOTE_AUDIO", "LOCAL_MIC_AUDIO", "FILE_AUDIO", "UNKNOWN"] = "MANUAL"
+    source: Literal[
+        "MANUAL",
+        "REMOTE_AUDIO",
+        "LOCAL_MIC_AUDIO",
+        "FILE_AUDIO",
+        "FILE",
+        "MIC",
+        "TAB_AUDIO",
+        "REMOTE",
+        "UNKNOWN",
+    ] = "MANUAL"
 
 
 class MeetingQuestionRequest(BaseModel):
@@ -172,6 +200,38 @@ class HealthResponse(BaseModel):
     model: str | None = None
     asr: Literal["ok", "unavailable", "error"]
     error: str | None = None
+
+
+class TranscriptSegment(BaseModel):
+    start: float
+    end: float
+    text: str
+    language: str | None = None
+    confidence: float | None = None
+
+
+class ASRTranscriptionResponse(BaseModel):
+    language: str | None = None
+    duration: float | None = None
+    audio_duration_seconds: float | None = None
+    processing_time_seconds: float
+    processing_time_ms: int
+    real_time_factor: float | None = None
+    segments: list[TranscriptSegment] = Field(default_factory=list)
+    provider: str = "faster-whisper"
+    model: str | None = None
+    device: str | None = None
+    compute_type: str | None = None
+
+
+class ASRStatusResponse(BaseModel):
+    status: Literal["idle", "loading", "ready", "error", "unavailable"]
+    provider: str = "faster-whisper"
+    model: str
+    device: str | None = None
+    compute_type: str | None = None
+    language: str | None = None
+    detail: str | None = None
 
 
 class MeetingEvent(BaseModel):

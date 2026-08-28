@@ -21,6 +21,22 @@ if [[ ! -d "$ROOT/frontend/node_modules" ]]; then
   exit 1
 fi
 
+PY_SITE_PACKAGES="$("$PYTHON_BIN" - <<'PY'
+import sysconfig
+print(sysconfig.get_paths()["purelib"])
+PY
+)"
+NVIDIA_LIB_PATHS=(
+  "$PY_SITE_PACKAGES/nvidia/cuda_nvrtc/lib"
+  "$PY_SITE_PACKAGES/nvidia/cublas/lib"
+  "$PY_SITE_PACKAGES/nvidia/cudnn/lib"
+)
+for lib_path in "${NVIDIA_LIB_PATHS[@]}"; do
+  if [[ -d "$lib_path" ]]; then
+    export LD_LIBRARY_PATH="$lib_path:${LD_LIBRARY_PATH:-}"
+  fi
+done
+
 cleanup() {
   trap - INT TERM EXIT
   kill "${BACKEND_PID:-}" "${FRONTEND_PID:-}" 2>/dev/null || true
