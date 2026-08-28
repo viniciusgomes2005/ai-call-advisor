@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from app.schemas import InterventionDecision, MeetingInsight, MeetingState, TranscriptSegment, Utterance
+from app.schemas import InterventionDecision, MeetingInsight, MeetingState, SemanticUtterance, TranscriptSegment, Utterance
 
 
 class EventLogger:
@@ -35,6 +35,23 @@ class EventLogger:
         if extra:
             payload.update(extra)
         self._append_jsonl_dict(session_dir / "transcript.jsonl", payload)
+
+    def log_transcript_event(
+        self, meeting_id: str, event: str, segment: TranscriptSegment, extra: dict[str, Any] | None = None
+    ) -> None:
+        payload = {"event": event, **segment.model_dump(mode="json")}
+        if extra:
+            payload.update(extra)
+        self._append_jsonl_dict(self.base_dir / meeting_id / "transcript_events.jsonl", payload)
+
+    def log_utterance_assembly_event(self, meeting_id: str, event: str, payload: dict[str, Any]) -> None:
+        self._append_jsonl_dict(self.base_dir / meeting_id / "utterance_assembly.jsonl", {"event": event, **payload})
+
+    def log_semantic_utterance(self, meeting_id: str, utterance: SemanticUtterance) -> None:
+        session_dir = self.base_dir / meeting_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        self._append_jsonl(session_dir / "semantic_utterances.jsonl", utterance)
+        self._update_assembly_metrics(session_dir, utterance)
 
     def log_asr_metrics(self, meeting_id: str, metrics: dict[str, Any]) -> None:
         session_dir = self.base_dir / meeting_id
@@ -85,6 +102,30 @@ class EventLogger:
             latencies.append(decision.llm_latency_ms)
         self._write_json(path, metrics)
 
+    def _update_assembly_metrics(self, session_dir: Path, utterance: SemanticUtterance) -> None:
+        path = session_dir / "metrics.json"
+        metrics: dict[str, Any] = {}
+        if path.exists():
+            metrics = json.loads(path.read_text(encoding="utf-8"))
+        counts = metrics.setdefault("segments_per_utterance", [])
+        count = utterance.segment_count or len(utterance.segment_ids)
+        counts.append(count)
+        latencies = metrics.setdefault("utterance_assembly_latencies_ms", [])
+        if utterance.assembly_latency_ms is not None:
+            latencies.append(utterance.assembly_latency_ms)
+        metrics["semantic_utterance_count"] = int(metrics.get("semantic_utterance_count", 0)) + 1
+        metrics["number_of_merged_segments"] = int(metrics.get("number_of_merged_segments", 0)) + max(0, count - 1)
+        if count <= 1:
+            metrics["number_of_single_segment_utterances"] = int(
+                metrics.get("number_of_single_segment_utterances", 0)
+            ) + 1
+        metrics["average_segments_per_utterance"] = sum(counts) / len(counts) if counts else None
+        metrics["p50_segments_per_utterance"] = self._percentile(counts, 50)
+        metrics["p95_segments_per_utterance"] = self._percentile(counts, 95)
+        if latencies:
+            metrics["utterance_assembly_latency_ms"] = sum(latencies) / len(latencies)
+        self._write_json(path, metrics)
+
     @staticmethod
     def _write_json(path: Path, value: BaseModel | dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,3 +146,13 @@ class EventLogger:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(value, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _percentile(values: list[int], percentile: int) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return float(ordered[0])
+        index = round((percentile / 100) * (len(ordered) - 1))
+        return float(ordered[index])
