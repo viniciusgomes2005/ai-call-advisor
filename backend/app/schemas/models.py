@@ -145,6 +145,47 @@ class MeetingInsight(BaseModel):
     timestamp: datetime = Field(default_factory=utc_now)
 
 
+class ScreenFrame(BaseModel):
+    """A single sampled+accepted frame of the shared screen (metadata only - the raw
+    image bytes never live on this model or on MeetingState, see VisualContext)."""
+
+    id: str = Field(default_factory=lambda: f"frame_{uuid4().hex}")
+    timestamp: float
+    captured_at: datetime = Field(default_factory=utc_now)
+    source: Literal["SCREEN_SHARE"] = "SCREEN_SHARE"
+    width: int
+    height: int
+    mime_type: str = "image/jpeg"
+    change_score: float | None = None
+
+
+class VisualAnalysis(BaseModel):
+    """Structured output of a future VisionProvider. NullVisionProvider (V1's only
+    implementation) never produces one - these fields stay empty/None until a real
+    vision model is wired in."""
+
+    summary: str | None = None
+    visible_text: list[str] = Field(default_factory=list)
+    entities: list[str] = Field(default_factory=list)
+    systems: list[str] = Field(default_factory=list)
+    numbers: list[str] = Field(default_factory=list)
+
+
+class VisualContext(BaseModel):
+    id: str = Field(default_factory=lambda: f"visual_{uuid4().hex}")
+    frame_id: str
+    timestamp: float
+    captured_at: datetime = Field(default_factory=utc_now)
+    source: Literal["SCREEN_SHARE"] = "SCREEN_SHARE"
+
+    # Intentionally empty in V1 - filled in by a VisionProvider later, never faked.
+    summary: str | None = None
+    visible_text: list[str] = Field(default_factory=list)
+    entities: list[str] = Field(default_factory=list)
+    systems: list[str] = Field(default_factory=list)
+    numbers: list[str] = Field(default_factory=list)
+
+
 class MeetingState(BaseModel):
     meeting_id: str = Field(default_factory=lambda: str(uuid4()))
     delegate: DelegateProfile
@@ -154,6 +195,25 @@ class MeetingState(BaseModel):
     previous_interventions: list[PreviousIntervention] = Field(default_factory=list)
     insights: list[MeetingInsight] = Field(default_factory=list)
     conversation_state: "ConversationState" = Field(default_factory=lambda: ConversationState())
+    recent_visual_contexts: list[VisualContext] = Field(default_factory=list)
+
+    def get_visual_context_near(
+        self, start: float, end: float | None = None, tolerance_seconds: float = 5.0
+    ) -> VisualContext | None:
+        """Find the recent VisualContext whose timestamp is closest to an utterance's
+        [start, end] window, within tolerance_seconds. Purely temporal correlation -
+        no image understanding happens here (see VisionProvider for that, later)."""
+        if not self.recent_visual_contexts:
+            return None
+        midpoint = start if end is None else (start + end) / 2
+        best: VisualContext | None = None
+        best_distance = float("inf")
+        for visual in self.recent_visual_contexts:
+            distance = abs(visual.timestamp - midpoint)
+            if distance <= tolerance_seconds and distance < best_distance:
+                best = visual
+                best_distance = distance
+        return best
 
 
 class ReplayRequest(BaseModel):
@@ -261,6 +321,35 @@ class SemanticUtterance(BaseModel):
     assembly_reason: str | None = None
     assembly_latency_ms: float | None = None
     segment_count: int = 0
+
+
+class ScreenFrameIngest(BaseModel):
+    """Inbound `screen.frame` WebSocket message. `timestamp` is meeting-elapsed
+    seconds on the same clock as TranscriptSegment/SemanticUtterance start/end (client
+    tracks elapsed time since live capture started, not wall clock) - see
+    ScreenFrameSampler on the frontend. `data` is base64-encoded compressed image bytes."""
+
+    timestamp: float
+    captured_at: datetime | None = None
+    mime_type: str = "image/jpeg"
+    width: int
+    height: int
+    change_score: float | None = None
+    data: str
+
+    @field_validator("data")
+    @classmethod
+    def non_empty_data(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("screen frame data cannot be empty")
+        return value
+
+    @field_validator("width", "height")
+    @classmethod
+    def positive_dimension(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("screen frame width/height must be positive")
+        return value
 
 
 class ASRTranscriptionResponse(BaseModel):

@@ -167,6 +167,7 @@ Arquivos gerados:
 - `utterances.jsonl`
 - `asr_metrics.jsonl`
 - `decisions.jsonl`
+- `visual_contexts.jsonl` (ver [Visual Context Pipeline](#visual-context-pipeline))
 
 Áudio bruto não é salvo por padrão.
 
@@ -185,6 +186,54 @@ Benchmark ASR:
 python benchmarks/run_asr_benchmark.py --audio sample.wav --model large-v3-turbo
 python benchmarks/run_asr_benchmark.py --audio sample.wav --model large-v3-turbo --domain-prompt
 ```
+
+## Visual Context Pipeline
+
+Além do áudio, o live meeting sincroniza contexto visual da tela compartilhada com a transcrição - sem nenhum modelo de visão ligado ainda. Esta etapa constrói só a captura/armazenamento:
+
+```text
+Shared Screen (o mesmo MediaStream do getDisplayMedia, sem pedir permissão de novo)
+  -> Frame Sampling (ScreenFrameSampler, a cada SCREEN_FRAME_SAMPLE_INTERVAL_MS)
+  -> Change Detection (grayscale 64x36, mean abs diff - determinístico, sem IA)
+  -> ScreenFrame (metadata: timestamp, dimensões, mime type, change_score)
+  -> WebSocket (`screen.frame`, JPEG comprimido em base64, no mesmo /ws/live)
+  -> VisualContext (backend; campos semânticos ficam vazios nesta etapa)
+  -> MeetingState.recent_visual_contexts (até VISUAL_CONTEXT_MAX_RECENT, mais antigo sai)
+```
+
+Pontos importantes:
+
+- O frontend reaproveita o `MediaStream` já usado para o preview e para `TAB_AUDIO` - não abre uma segunda captura de tela.
+- `timestamp` do frame usa segundos decorridos desde o início da captura live (mesma família de relógio que `TranscriptSegment.start`/`end`), não `Date.now()`. Isso permite `MeetingState.get_visual_context_near(start, end, tolerance_seconds=5)` encontrar o frame mais próximo de uma utterance.
+- Frames quase idênticos são descartados; um "force capture" garante um frame atualizado a cada `SCREEN_FRAME_FORCE_CAPTURE_INTERVAL_MS` mesmo com a tela parada.
+- `SAVE_SCREEN_FRAMES=false` (padrão): a imagem passa pelo backend só em memória durante o processamento da mensagem; nunca é gravada em disco e nunca entra no `MeetingState` (só metadata). Com `true`, é salva em `backend/data/sessions/{meeting_id}/frames/frame_000001.jpg`.
+- `VisionProvider` (`backend/app/vision/provider.py`) é a interface pronta para um modelo multimodal depois (`Screenshot -> VisionProvider -> VisualContext`). A única implementação hoje é `NullVisionProvider`, que não produz análise nenhuma - `summary`, `visible_text`, `entities`, `systems` e `numbers` ficam vazios/`None` de propósito, nunca inventados.
+- Sampling não bloqueia áudio/ASR/LLM: cada frame aceito é processado em uma task assíncrona separada no backend, e o `ScreenFrameSampler` do frontend para sozinho quando a reunião termina, a captura de tela é encerrada pelo usuário, ou a track de vídeo acaba.
+
+Configuração em `backend/.env`:
+
+```env
+SCREEN_FRAME_SAMPLING_ENABLED=true
+SCREEN_FRAME_SAMPLE_INTERVAL_MS=4000
+SCREEN_FRAME_FORCE_CAPTURE_INTERVAL_MS=30000
+SCREEN_FRAME_CHANGE_THRESHOLD=0.04
+SCREEN_FRAME_MAX_DIMENSION=1280
+SCREEN_FRAME_JPEG_QUALITY=0.7
+VISUAL_CONTEXT_MAX_RECENT=5
+SAVE_SCREEN_FRAMES=false
+```
+
+Na UI, o botão de monitor no cabeçalho do preview de tela liga o "Show visual debug": frames sampled/skipped/accepted, o último frame aceito (com thumbnail) e os `VisualContext` recentes recebidos do backend.
+
+Teste manual:
+
+1. Inicie o app e clique `Iniciar captura`.
+2. Compartilhe uma janela estática (ex.: um slide parado) e ligue `Show visual debug`.
+3. Confirme que poucos frames são aceitos (a maioria fica em "skipped").
+4. Troque de janela/slide - um frame deve ser aceito (`change_above_threshold`).
+5. Volte para a tela estática - frames voltam a ser descartados.
+6. Fale durante esse tempo todo e confirme que a transcrição continua fluida (sem travar).
+7. Pare a reunião e confirme, pelos logs (`asr audio debug`/console), que o sampler parou.
 
 ## Conectar com Google Meet
 

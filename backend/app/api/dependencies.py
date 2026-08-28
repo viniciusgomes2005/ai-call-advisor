@@ -11,6 +11,7 @@ from app.meeting import MeetingEngine
 from app.services.logger import EventLogger
 from app.settings import get_settings
 from app.schemas import DelegateProfile
+from app.vision import NullVisionProvider, VisionProvider
 
 
 def prompt_path() -> Path:
@@ -53,4 +54,11 @@ def make_engine(delegate: DelegateProfile, meeting_id: str | None = None, model:
         model=model or settings.llm_model or None,
         max_suggestion_age_seconds=settings.max_suggestion_age_seconds,
         enable_structured_meeting_state=settings.enable_structured_meeting_state,
+        visual_context_max_recent=settings.visual_context_max_recent,
     )
+
+
+def make_vision_provider() -> VisionProvider:
+    # No vision model wired in yet (see app/vision/provider.py) - this is the seam a
+    # real multimodal provider plugs into later without touching the capture pipeline.
+    return NullVisionProvider()

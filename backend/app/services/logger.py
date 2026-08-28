@@ -6,7 +6,17 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from app.schemas import InterventionDecision, MeetingInsight, MeetingState, SemanticUtterance, TranscriptSegment, Utterance
+from app.schemas import (
+    InterventionDecision,
+    MeetingInsight,
+    MeetingState,
+    ScreenFrame,
+    SemanticUtterance,
+    TranscriptSegment,
+    Utterance,
+    VisualContext,
+)
+from app.services.visual import screen_frame_filename
 
 
 class EventLogger:
@@ -52,6 +62,31 @@ class EventLogger:
         session_dir.mkdir(parents=True, exist_ok=True)
         self._append_jsonl(session_dir / "semantic_utterances.jsonl", utterance)
         self._update_assembly_metrics(session_dir, utterance)
+
+    def log_visual_context(
+        self, meeting_id: str, frame: ScreenFrame, visual: VisualContext, image_path: Path | None = None
+    ) -> None:
+        session_dir = self.base_dir / meeting_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        payload = visual.model_dump(mode="json")
+        payload["change_score"] = frame.change_score
+        payload["width"] = frame.width
+        payload["height"] = frame.height
+        if image_path is not None:
+            # Only ever a path when SAVE_SCREEN_FRAMES=true - never a base64 blob in the jsonl.
+            payload["image_path"] = str(image_path)
+        self._append_jsonl_dict(session_dir / "visual_contexts.jsonl", payload)
+        self._update_visual_metrics(session_dir, frame)
+
+    def save_screen_frame(self, meeting_id: str, sequence: int, image_bytes: bytes, mime_type: str) -> Path:
+        """Persist the raw frame to disk. Only called by the caller when
+        SAVE_SCREEN_FRAMES=true - the default (false) never reaches this method, so raw
+        screenshots never touch disk unless explicitly opted in."""
+        frames_dir = self.base_dir / meeting_id / "frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        path = frames_dir / screen_frame_filename(sequence, mime_type)
+        path.write_bytes(image_bytes)
+        return path
 
     def log_asr_metrics(self, meeting_id: str, metrics: dict[str, Any]) -> None:
         session_dir = self.base_dir / meeting_id
@@ -124,6 +159,19 @@ class EventLogger:
         metrics["p95_segments_per_utterance"] = self._percentile(counts, 95)
         if latencies:
             metrics["utterance_assembly_latency_ms"] = sum(latencies) / len(latencies)
+        self._write_json(path, metrics)
+
+    def _update_visual_metrics(self, session_dir: Path, frame: ScreenFrame) -> None:
+        path = session_dir / "metrics.json"
+        metrics: dict[str, Any] = {}
+        if path.exists():
+            metrics = json.loads(path.read_text(encoding="utf-8"))
+        metrics["visual_context_count"] = int(metrics.get("visual_context_count", 0)) + 1
+        metrics["screen_frames_accepted"] = int(metrics.get("screen_frames_accepted", 0)) + 1
+        if frame.change_score is not None:
+            scores = metrics.setdefault("change_scores", [])
+            scores.append(frame.change_score)
+            metrics["average_change_score"] = sum(scores) / len(scores)
         self._write_json(path, metrics)
 
     @staticmethod

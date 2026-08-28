@@ -18,6 +18,7 @@ from app.schemas import (
     PreviousIntervention,
     SemanticUtterance,
     Utterance,
+    VisualContext,
 )
 from app.services.logger import EventLogger
 
@@ -34,6 +35,7 @@ class MeetingEngine:
         model: str | None = None,
         max_suggestion_age_seconds: int = 15,
         enable_structured_meeting_state: bool = False,
+        visual_context_max_recent: int = 5,
     ):
         self.state = MeetingState(meeting_id=meeting_id, delegate=delegate) if meeting_id else MeetingState(delegate=delegate)
         self.llm_provider = llm_provider
@@ -43,6 +45,7 @@ class MeetingEngine:
         self.model = model
         self.max_suggestion_age_seconds = max_suggestion_age_seconds
         self.enable_structured_meeting_state = enable_structured_meeting_state
+        self.visual_context_max_recent = visual_context_max_recent
         self._lock = asyncio.Lock()
         self.event_logger.start_session(self.state)
 
@@ -191,6 +194,16 @@ class MeetingEngine:
                 state.open_questions.append(insight.text)
             elif insight.type == "DECISION" and insight.text not in state.decisions:
                 state.decisions.append(insight.text)
+
+    async def record_visual_context(self, visual: VisualContext) -> None:
+        """Append a finalized VisualContext to recent_visual_contexts, capped at
+        visual_context_max_recent (oldest evicted first). Uses the same lock as
+        utterance recording since both mutate self.state concurrently from live_ws."""
+        async with self._lock:
+            self.state.recent_visual_contexts.append(visual)
+            if len(self.state.recent_visual_contexts) > self.visual_context_max_recent:
+                self.state.recent_visual_contexts = self.state.recent_visual_contexts[-self.visual_context_max_recent :]
+            self.event_logger.save_state(self.state)
 
     def insights_for_utterance(self, utterance_id: int) -> list[MeetingInsight]:
         return [insight for insight in self.state.insights if insight.utterance_id == utterance_id]

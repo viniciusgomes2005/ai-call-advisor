@@ -12,8 +12,9 @@ from uuid import uuid4
 
 import httpx
 from fastapi import APIRouter, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from pydantic import ValidationError
 
-from app.api.dependencies import make_asr_provider, make_engine, make_llm_provider
+from app.api.dependencies import make_asr_provider, make_engine, make_llm_provider, make_vision_provider
 from app.asr.streaming import AudioQueueItem, FinalizedAudio, SpeechSegmenter, SpeechStarted
 from app.meeting.utterance_assembler import AssemblyResult, TranscriptOrderingBuffer, UtteranceAssembler, UtteranceAssemblerConfig
 from app.schemas import (
@@ -28,12 +29,14 @@ from app.schemas import (
     MeetingEvent,
     MeetingResponse,
     ReplayRequest,
+    ScreenFrameIngest,
     TranscriptSegment,
     Utterance,
 )
 from app.services.logger import EventLogger
 from app.services.live import LiveMeetingSession
 from app.services.replay import ReplayService
+from app.services.visual import build_screen_frame, build_visual_context, decode_frame_data
 from app.settings import get_settings
 
 router = APIRouter()
@@ -268,6 +271,9 @@ async def live_ws(websocket: WebSocket):
     send_lock = asyncio.Lock()
     disconnected = False
     chunk_stats: dict[str, dict[str, int | float]] = {}
+    vision_provider = make_vision_provider()
+    visual_tasks: set[asyncio.Task[None]] = set()
+    screen_frame_sequence = 0
 
     def current_meeting_id() -> str | None:
         return session.engine.state.meeting_id if session else None
@@ -597,6 +603,59 @@ async def live_ws(websocket: WebSocket):
             finally:
                 audio_queue.task_done()
 
+    async def handle_screen_frame(message: dict) -> None:
+        # Runs as its own task (see the "screen.frame" dispatch below) - never awaited
+        # inline from the main receive loop, so a slow frame (disk write, or a future
+        # vision model call) can never delay reading the next audio.chunk off the socket.
+        nonlocal screen_frame_sequence
+        if not session or not settings.screen_frame_sampling_enabled:
+            return
+        meeting_id = session.engine.state.meeting_id
+        try:
+            payload = ScreenFrameIngest.model_validate(message)
+            image_bytes = decode_frame_data(payload.data)
+
+            sequence = screen_frame_sequence
+            screen_frame_sequence += 1
+
+            frame = build_screen_frame(
+                frame_id=f"frame_{sequence:06d}",
+                timestamp=payload.timestamp,
+                captured_at=payload.captured_at,
+                mime_type=payload.mime_type,
+                width=payload.width,
+                height=payload.height,
+                change_score=payload.change_score,
+            )
+
+            image_path = None
+            if settings.save_screen_frames:
+                image_path = session.engine.event_logger.save_screen_frame(meeting_id, sequence, image_bytes, payload.mime_type)
+
+            analysis = await vision_provider.analyze_frame(image_bytes, frame)
+            visual = build_visual_context(visual_id=f"visual_{sequence:06d}", frame=frame, analysis=analysis)
+
+            await session.engine.record_visual_context(visual)
+            session.engine.event_logger.log_visual_context(meeting_id, frame, visual, image_path)
+            log_audio_debug(
+                "screen.frame.accepted",
+                {"frame_id": frame.id, "timestamp": frame.timestamp, "change_score": frame.change_score},
+            )
+            await send_event(
+                MeetingEvent(type="visual_context.created", meeting_id=meeting_id, payload=visual.model_dump(mode="json"))
+            )
+        except (ValidationError, ValueError) as exc:
+            log_audio_debug("screen.frame.rejected", {"error": str(exc)})
+            await send_event(
+                MeetingEvent(type="screen.frame.rejected", meeting_id=current_meeting_id(), payload={"error": str(exc)})
+            )
+        except Exception as exc:
+            # A malformed/failed frame must never take down the audio/transcript pipeline.
+            logger.exception("Failed to process screen.frame")
+            await send_event(
+                MeetingEvent(type="screen.frame.rejected", meeting_id=current_meeting_id(), payload={"error": str(exc)})
+            )
+
     worker_task = asyncio.create_task(audio_worker())
 
     try:
@@ -716,11 +775,19 @@ async def live_ws(websocket: WebSocket):
                 final_audio = segmenter_for(source).flush(source, reason=AudioFinalizationReason.MANUAL_FLUSH)
                 if final_audio:
                     schedule_asr(final_audio)
+            elif event_type == "screen.frame":
+                if not session:
+                    raise RuntimeError("meeting.start must be sent first")
+                task = asyncio.create_task(handle_screen_frame(message))
+                visual_tasks.add(task)
+                task.add_done_callback(visual_tasks.discard)
             elif event_type == "meeting.stop":
                 await audio_queue.put(None)
                 await worker_task
                 if asr_tasks:
                     await asyncio.gather(*asr_tasks, return_exceptions=True)
+                if visual_tasks:
+                    await asyncio.gather(*visual_tasks, return_exceptions=True)
                 if assembly_flush_task:
                     assembly_flush_task.cancel()
                 if assembler is not None:
@@ -736,6 +803,8 @@ async def live_ws(websocket: WebSocket):
         worker_task.cancel()
         if asr_tasks:
             await asyncio.gather(*asr_tasks, return_exceptions=True)
+        if visual_tasks:
+            await asyncio.gather(*visual_tasks, return_exceptions=True)
         if assembly_flush_task:
             assembly_flush_task.cancel()
         if assembler is not None:
@@ -747,3 +816,6 @@ async def live_ws(websocket: WebSocket):
             worker_task.cancel()
         if assembly_flush_task and not assembly_flush_task.done():
             assembly_flush_task.cancel()
+        for task in visual_tasks:
+            if not task.done():
+                task.cancel()

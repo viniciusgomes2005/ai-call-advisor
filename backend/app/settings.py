@@ -34,6 +34,19 @@ class Settings(BaseSettings):
     utterance_finalization_delay_ms: int = 500
     utterance_backlog_warning_threshold: int = 8
     enable_structured_meeting_state: bool = False
+
+    # Visual context pipeline (shared screen -> frame sampling -> change detection ->
+    # ScreenFrame/VisualContext). See app/vision/provider.py - no vision model is wired
+    # in yet, this only builds the synchronized capture/storage pipeline for one later.
+    screen_frame_sampling_enabled: bool = True
+    screen_frame_sample_interval_ms: int = 4000
+    screen_frame_force_capture_interval_ms: int = 30000
+    screen_frame_change_threshold: float = 0.04
+    screen_frame_max_dimension: int = 1280
+    screen_frame_jpeg_quality: float = 0.7
+    visual_context_max_recent: int = 5
+    save_screen_frames: bool = False
+
     save_raw_audio: bool = False
     language: str = "pt"
 

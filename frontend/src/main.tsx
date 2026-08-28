@@ -15,6 +15,12 @@ import {
   VolumeX,
 } from "lucide-react";
 import "./styles.css";
+import {
+  DEFAULT_CHANGE_DETECTION_CONFIG,
+  ScreenFrameSampler,
+  type ScreenFrameSample,
+  type ScreenFrameSamplerStats,
+} from "./screenFrameSampler";
 
 type Category = "EXPLICIT_CUE" | "IMPLICIT_CUE" | "CHIME_IN" | "KEEP_SILENCE";
 type AudioSource = "TAB_AUDIO" | "MIC";
@@ -91,6 +97,22 @@ type SemanticUtteranceDebug = {
   assembly_latency_ms: number | null;
   final: boolean;
 };
+type VisualContextDebug = {
+  id: string;
+  frame_id: string;
+  timestamp: number;
+  captured_at: string;
+  change_score: number | null;
+};
+type LastAcceptedFrame = {
+  frame_id: string;
+  timestamp: number;
+  captured_at: string;
+  width: number;
+  height: number;
+  change_score: number | null;
+  thumbnailUrl: string;
+};
 
 const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 const WS = API.replace(/^http/, "ws");
@@ -134,6 +156,15 @@ function App() {
   const [showDebugSegments, setShowDebugSegments] = useState(false);
   const [debugTranscriptSegments, setDebugTranscriptSegments] = useState<TranscriptSegmentDebug[]>([]);
   const [debugSemanticUtterances, setDebugSemanticUtterances] = useState<SemanticUtteranceDebug[]>([]);
+  const [showVisualDebug, setShowVisualDebug] = useState(false);
+  const [screenFrameStats, setScreenFrameStats] = useState<ScreenFrameSamplerStats>({
+    sampled: 0,
+    skipped: 0,
+    accepted: 0,
+    lastChangeScore: null,
+  });
+  const [lastAcceptedFrame, setLastAcceptedFrame] = useState<LastAcceptedFrame | null>(null);
+  const [visualContexts, setVisualContexts] = useState<VisualContextDebug[]>([]);
   const [liveActive, setLiveActive] = useState(false);
   const [llmEnabled, setLlmEnabled] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -158,6 +189,9 @@ function App() {
   const audioContexts = useRef<AudioContext[]>([]);
   const audioNodes = useRef<AudioNode[]>([]);
   const meterUpdateAt = useRef<Record<AudioSource, number>>({ TAB_AUDIO: 0, MIC: 0 });
+  const screenFrameSamplerRef = useRef<ScreenFrameSampler | null>(null);
+  const liveStartRef = useRef<number | null>(null);
+  const lastThumbnailUrlRef = useRef<string | null>(null);
 
   const latestDecision = useMemo(
     () => [...decisions].reverse().find((item) => item.should_intervene && item.response),
@@ -207,6 +241,13 @@ function App() {
     return () => stopLive();
   }, []);
 
+  function revokeLastThumbnail() {
+    if (lastThumbnailUrlRef.current) {
+      URL.revokeObjectURL(lastThumbnailUrlRef.current);
+      lastThumbnailUrlRef.current = null;
+    }
+  }
+
   function resetSession() {
     stopLive();
     setMeetingId("");
@@ -221,6 +262,10 @@ function App() {
     setManualText("");
     setQuestion("");
     setCaptureError("");
+    setScreenFrameStats({ sampled: 0, skipped: 0, accepted: 0, lastChangeScore: null });
+    revokeLastThumbnail();
+    setLastAcceptedFrame(null);
+    setVisualContexts([]);
   }
 
   function updateLlmEnabled(enabled: boolean) {
@@ -242,6 +287,10 @@ function App() {
     setDebugSemanticUtterances([]);
     setAsrProcessing(0);
     setLastTranscriptEmpty(false);
+    setScreenFrameStats({ sampled: 0, skipped: 0, accepted: 0, lastChangeScore: null });
+    revokeLastThumbnail();
+    setLastAcceptedFrame(null);
+    setVisualContexts([]);
 
     let display: MediaStream | null = null;
     let mic: MediaStream | null = null;
@@ -270,8 +319,10 @@ function App() {
         }),
       );
 
+      liveStartRef.current = performance.now();
       startPcmSender(socket, new MediaStream(displayStream.getAudioTracks()), "TAB_AUDIO");
       startPcmSender(socket, new MediaStream(micStream.getAudioTracks()), "MIC");
+      startScreenFrameSampler(socket, displayStream);
       setTrackStatus((prev) => ({
         ...prev,
         TAB_AUDIO: displayStream.getAudioTracks().length ? "capturing" : "no track",
@@ -344,6 +395,13 @@ function App() {
         return [...withoutCurrent.slice(-49), semantic];
       });
     }
+    if (event.type === "visual_context.created") {
+      const visual = event.payload as VisualContextDebug;
+      setVisualContexts((prev) => [...prev.slice(-9), visual]);
+    }
+    if (event.type === "screen.frame.rejected") {
+      setDebug((prev) => ({ ...prev, "Frame rejeitado": String(event.payload.error ?? "erro") }));
+    }
     if (event.type === "asr.started") {
       setAsrProcessing((count) => count + 1);
       setDebug((prev) => ({
@@ -390,6 +448,52 @@ function App() {
     }
   }
 
+  function startScreenFrameSampler(socket: WebSocket, displayStream: MediaStream) {
+    const videoTrack = displayStream.getVideoTracks()[0];
+    if (!videoTrack) return; // e.g. audio-only share - nothing to sample
+    const sampler = new ScreenFrameSampler({
+      getVideoElement: () => videoRef.current,
+      videoTrack,
+      getElapsedSeconds: () => (liveStartRef.current === null ? 0 : (performance.now() - liveStartRef.current) / 1000),
+      config: DEFAULT_CHANGE_DETECTION_CONFIG,
+      onAccepted: (sample) => void handleAcceptedFrame(socket, sample),
+      onStats: (stats) => setScreenFrameStats(stats),
+    });
+    screenFrameSamplerRef.current = sampler;
+    sampler.start();
+  }
+
+  async function handleAcceptedFrame(socket: WebSocket, sample: ScreenFrameSample) {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    const buffer = await sample.blob.arrayBuffer();
+    if (socket.readyState !== WebSocket.OPEN) return; // socket may have closed while encoding
+    const frameId = `frame_${Math.round(sample.timestamp * 1000)}`;
+    socket.send(
+      JSON.stringify({
+        type: "screen.frame",
+        timestamp: sample.timestamp,
+        captured_at: sample.capturedAt,
+        mime_type: sample.mimeType,
+        width: sample.width,
+        height: sample.height,
+        change_score: sample.changeScore,
+        data: arrayBufferToBase64(buffer),
+      }),
+    );
+    revokeLastThumbnail();
+    const thumbnailUrl = URL.createObjectURL(sample.blob);
+    lastThumbnailUrlRef.current = thumbnailUrl;
+    setLastAcceptedFrame({
+      frame_id: frameId,
+      timestamp: sample.timestamp,
+      captured_at: sample.capturedAt,
+      width: sample.width,
+      height: sample.height,
+      change_score: sample.changeScore,
+      thumbnailUrl,
+    });
+  }
+
   function startPcmSender(socket: WebSocket, stream: MediaStream, source: AudioSource) {
     if (stream.getAudioTracks().length === 0) {
       setTrackStatus((prev) => ({ ...prev, [source]: "no track" }));
@@ -432,6 +536,9 @@ function App() {
   }
 
   function stopLive() {
+    screenFrameSamplerRef.current?.stop();
+    screenFrameSamplerRef.current = null;
+    liveStartRef.current = null;
     for (const node of audioNodes.current) {
       try {
         node.disconnect();
@@ -654,9 +761,19 @@ function App() {
             <span className="eyebrow">Screen preview</span>
             <h2>{screenStatus}</h2>
           </div>
-          <div className={liveActive ? "livePill on" : "livePill"}>
-            {liveActive ? <CheckCircle2 size={15} /> : <Circle size={15} />}
-            {liveActive ? "LIVE" : "IDLE"}
+          <div className="stageActions">
+            <button
+              className={showVisualDebug ? "iconButton isActive" : "iconButton"}
+              onClick={() => setShowVisualDebug((value) => !value)}
+              title="Show visual debug"
+              aria-pressed={showVisualDebug}
+            >
+              <MonitorUp size={16} />
+            </button>
+            <div className={liveActive ? "livePill on" : "livePill"}>
+              {liveActive ? <CheckCircle2 size={15} /> : <Circle size={15} />}
+              {liveActive ? "LIVE" : "IDLE"}
+            </div>
           </div>
         </header>
 
@@ -686,6 +803,56 @@ function App() {
             status={trackStatus.MIC}
           />
         </div>
+
+        {showVisualDebug && (
+          <section className="debugPanel">
+            <div className="debugPanelHeader">
+              <span>Visual debug</span>
+              <small>
+                {screenFrameStats.accepted} accepted / {screenFrameStats.skipped} skipped / {screenFrameStats.sampled} sampled
+              </small>
+            </div>
+            <div className="debugColumns">
+              <div className="debugColumn">
+                <strong>Ultimo frame aceito</strong>
+                {!lastAcceptedFrame && <small>Nenhum frame aceito ainda</small>}
+                {lastAcceptedFrame && (
+                  <article className="debugItem final visualDebugItem">
+                    <img src={lastAcceptedFrame.thumbnailUrl} alt="Ultimo frame aceito" className="visualDebugThumb" />
+                    <div>
+                      <code>#{lastAcceptedFrame.frame_id}</code>
+                      <small>
+                        {lastAcceptedFrame.width}x{lastAcceptedFrame.height} · t={lastAcceptedFrame.timestamp.toFixed(1)}s
+                      </small>
+                      <small>
+                        change_score={" "}
+                        {typeof lastAcceptedFrame.change_score === "number" ? lastAcceptedFrame.change_score.toFixed(3) : "-"}
+                      </small>
+                      <small>{lastAcceptedFrame.captured_at}</small>
+                    </div>
+                  </article>
+                )}
+              </div>
+              <div className="debugColumn">
+                <strong>VisualContext</strong>
+                <small>Last change score: {screenFrameStats.lastChangeScore?.toFixed(3) ?? "-"}</small>
+                {visualContexts.length === 0 && <small>Nenhum VisualContext ainda</small>}
+                {visualContexts
+                  .slice(-8)
+                  .reverse()
+                  .map((visual) => (
+                    <article key={visual.id} className="debugItem">
+                      <code>#{visual.id}</code>
+                      <small>
+                        frame={visual.frame_id} · t={visual.timestamp.toFixed(1)}s
+                        {typeof visual.change_score === "number" ? ` · change=${visual.change_score.toFixed(3)}` : ""}
+                      </small>
+                    </article>
+                  ))}
+              </div>
+            </div>
+          </section>
+        )}
 
         <section className="signalPanel">
           <Metric label="Utterances" value={String(utterances.length)} />
